@@ -32,13 +32,18 @@ RDS Data API (`rds-data`) is documented separately because it uses REST JSON rou
 | `DescribeDBParameterGroups` | List parameter groups |
 | `DeleteDBParameterGroup` | Delete a parameter group |
 | `ModifyDBParameterGroup` | Update parameter group settings |
+| `CopyDBParameterGroup` | Copy a parameter group (by name or ARN) with its family and parameter overrides into a new group |
+| `ResetDBParameterGroup` | Reset named parameters, or all of them, to engine defaults |
 | `DescribeDBParameters` | List parameters in a group |
 | `CreateDBClusterParameterGroup` | Create an Aurora-compatible cluster parameter group |
 | `DescribeDBClusterParameterGroups` | List cluster parameter groups |
 | `DeleteDBClusterParameterGroup` | Delete a cluster parameter group |
 | `ModifyDBClusterParameterGroup` | Update cluster parameter group settings |
+| `CopyDBClusterParameterGroup` | Copy a cluster parameter group, including a managed `default.*` group, into a new group |
+| `ResetDBClusterParameterGroup` | Reset named cluster parameters, or all of them, to engine defaults |
 | `DescribeDBClusterParameters` | List parameters in a cluster group |
 | `CreateOptionGroup` | Create an option group |
+| `CopyOptionGroup` | Copy an option group with its engine, major version and options into a new group |
 | `DescribeOptionGroups` | List option groups, including the implicit `default:` groups |
 | `ModifyOptionGroup` | Add, update, or remove options in an option group |
 | `DeleteOptionGroup` | Delete an option group |
@@ -306,7 +311,7 @@ Known gaps, all deliberate:
 
 | Behavior | Status |
 |---|---|
-| `CopyOptionGroup`, `DescribeOptionGroupOptions` | Not implemented — separate actions, not part of option group CRUD |
+| `DescribeOptionGroupOptions` | Not implemented: the per-engine option catalog is not modeled |
 | `OptionGroupQuotaExceededFault` (AWS caps an account at 20 groups) | Not enforced — capping a local emulator would only get in a test's way |
 | `OptionSetting` metadata (`DataType`, `ApplyType`, `AllowedValues`, `DefaultValue`, `Description`) | Omitted — it would require the per-engine option catalog `DescribeOptionGroupOptions` serves |
 | `MaxRecords` / `Marker` pagination | Every group is returned in one page, as with every other RDS list action |
