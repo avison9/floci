@@ -3427,6 +3427,78 @@ public class RdsService implements Resettable, ResourceProvider {
         return group;
     }
 
+    /**
+     * CopyDBParameterGroup: a new group with the source's family and parameter overrides. The
+     * source may be named by identifier or ARN; the target must not exist yet. Both names must
+     * be valid identifiers, which is how AWS refuses to copy a {@code default.*} group: its name
+     * contains periods, and the reference says to create a custom group for the family instead.
+     */
+    public DbParameterGroup copyDbParameterGroup(
+            String sourceIdentifier, String targetName, String targetDescription, String region) {
+        String effectiveRegion = effectiveRegion(region);
+        String sourceName = groupNameFromIdentifier(sourceIdentifier);
+        requireParameterGroupIdentifier(sourceName);
+        requireParameterGroupIdentifier(targetName);
+        DbParameterGroup source = getDbParameterGroup(sourceName, effectiveRegion);
+        DbParameterGroup target = createDbParameterGroup(
+                targetName, source.getDbParameterGroupFamily(), targetDescription, effectiveRegion);
+        target.getParameters().putAll(source.getParameters());
+        putParameterGroupForRegion(targetName, effectiveRegion, target);
+        return target;
+    }
+
+    /**
+     * ResetDBParameterGroup: drops the overrides for the named parameters, or every override when
+     * {@code resetAllParameters} is set, so the group answers with engine defaults again.
+     */
+    public DbParameterGroup resetDbParameterGroup(
+            String name, boolean resetAllParameters, List<String> parameterNames, String region) {
+        String effectiveRegion = effectiveRegion(region);
+        DbParameterGroup group = getDbParameterGroup(name, effectiveRegion);
+        resetParameters(group.getParameters(), resetAllParameters, parameterNames);
+        putParameterGroupForRegion(name, effectiveRegion, group);
+        return group;
+    }
+
+    /**
+     * The identifier rule AWS applies to a copy's source and target parameter group names. A
+     * managed {@code default.*} group fails it on the period, which is the documented way a
+     * default group cannot be copied.
+     */
+    private static void requireParameterGroupIdentifier(String name) {
+        if (name == null || !name.matches("[A-Za-z](?:[A-Za-z0-9]|-(?!-))*") || name.endsWith("-")) {
+            throw new AwsException("InvalidParameterValue",
+                    "The parameter DBParameterGroupName is not a valid identifier. Identifiers must begin with a "
+                            + "letter; must contain only ASCII letters, digits, and hyphens; and must not end with "
+                            + "a hyphen or contain two consecutive hyphens.", 400);
+        }
+    }
+
+    /**
+     * The group name behind an identifier that may be an ARN
+     * ({@code arn:aws:rds:region:account:pg:name}); names cannot contain a colon.
+     */
+    private static String groupNameFromIdentifier(String identifier) {
+        if (identifier != null && identifier.startsWith("arn:")) {
+            return identifier.substring(identifier.lastIndexOf(':') + 1);
+        }
+        return identifier;
+    }
+
+    private static void resetParameters(Map<String, String> overrides, boolean resetAllParameters,
+                                        List<String> parameterNames) {
+        boolean namesGiven = parameterNames != null && !parameterNames.isEmpty();
+        if (resetAllParameters && namesGiven) {
+            throw new AwsException("InvalidParameterCombination",
+                    "You can't specify Parameters when ResetAllParameters is enabled.", 400);
+        }
+        if (namesGiven) {
+            parameterNames.forEach(overrides::remove);
+        } else {
+            overrides.clear();
+        }
+    }
+
     public DbSubnetGroup getDbSubnetGroup(String name) {
         return getDbSubnetGroup(name, regionResolver.getDefaultRegion());
     }
@@ -3632,6 +3704,39 @@ public class RdsService implements Resettable, ResourceProvider {
         return group;
     }
 
+    /**
+     * CopyDBClusterParameterGroup: a new group with the source's family and parameter overrides.
+     * The source is a customer group named by identifier or ARN; a managed {@code default.*}
+     * group fails the identifier rule, as on AWS. The target must not exist yet.
+     */
+    public DbClusterParameterGroup copyDbClusterParameterGroup(
+            String sourceIdentifier, String targetName, String targetDescription, String region) {
+        String effectiveRegion = effectiveRegion(region);
+        String sourceName = groupNameFromIdentifier(sourceIdentifier);
+        requireParameterGroupIdentifier(sourceName);
+        requireParameterGroupIdentifier(targetName);
+        DbClusterParameterGroup source = getDbClusterParameterGroup(sourceName, effectiveRegion);
+        DbClusterParameterGroup target = createDbClusterParameterGroup(
+                targetName, source.getDbParameterGroupFamily(), targetDescription, effectiveRegion);
+        target.getParameters().putAll(source.getParameters());
+        putClusterParameterGroupForRegion(targetName, effectiveRegion, target);
+        return target;
+    }
+
+    /** ResetDBClusterParameterGroup; the managed {@code default.*} groups cannot be reset. */
+    public DbClusterParameterGroup resetDbClusterParameterGroup(
+            String name, boolean resetAllParameters, List<String> parameterNames, String region) {
+        String effectiveRegion = effectiveRegion(region);
+        if (managedClusterParameterGroup(name) != null) {
+            throw new AwsException("InvalidDBParameterGroupState",
+                    "The default DB cluster parameter group cannot be modified.", 400);
+        }
+        DbClusterParameterGroup group = getDbClusterParameterGroup(name, effectiveRegion);
+        resetParameters(group.getParameters(), resetAllParameters, parameterNames);
+        putClusterParameterGroupForRegion(name, effectiveRegion, group);
+        return group;
+    }
+
     // ── Option Groups ─────────────────────────────────────────────────────────
 
     public OptionGroup createOptionGroup(
@@ -3658,6 +3763,37 @@ public class RdsService implements Resettable, ResourceProvider {
         group.setTags(tags == null ? new LinkedHashMap<>() : new LinkedHashMap<>(tags));
         putOptionGroupForRegion(name, effectiveRegion, group);
         return group;
+    }
+
+    /**
+     * CopyOptionGroup: a new group for the source's engine and major version carrying copies of
+     * its options. The source may be a customer group or a managed {@code default:*} group, named
+     * by identifier or ARN; the target must not exist yet.
+     */
+    public OptionGroup copyOptionGroup(String sourceIdentifier, String targetName,
+                                       String targetDescription, Map<String, String> tags, String region) {
+        String effectiveRegion = effectiveRegion(region);
+        OptionGroup source = getOptionGroup(groupNameFromIdentifier(sourceIdentifier), effectiveRegion);
+        OptionGroup target = createOptionGroup(targetName, source.getEngineName(),
+                source.getMajorEngineVersion(), targetDescription, tags, effectiveRegion);
+        for (OptionGroupOption option : source.getOptions()) {
+            target.getOptions().add(copyOption(option));
+        }
+        putOptionGroupForRegion(targetName, effectiveRegion, target);
+        return target;
+    }
+
+    private static OptionGroupOption copyOption(OptionGroupOption source) {
+        OptionGroupOption copy = new OptionGroupOption(source.getOptionName());
+        copy.setOptionDescription(source.getOptionDescription());
+        copy.setOptionVersion(source.getOptionVersion());
+        copy.setPort(source.getPort());
+        copy.setPersistent(source.isPersistent());
+        copy.setPermanent(source.isPermanent());
+        copy.setOptionSettings(new LinkedHashMap<>(source.getOptionSettings()));
+        copy.setVpcSecurityGroupMemberships(new ArrayList<>(source.getVpcSecurityGroupMemberships()));
+        copy.setDbSecurityGroupMemberships(new ArrayList<>(source.getDbSecurityGroupMemberships()));
+        return copy;
     }
 
     public OptionGroup getOptionGroup(String name) {

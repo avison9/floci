@@ -31,6 +31,7 @@ import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -85,13 +86,18 @@ public class RdsQueryHandler {
                 case "DescribeDBParameterGroups" -> handleDescribeDbParameterGroups(params, region);
                 case "DeleteDBParameterGroup" -> handleDeleteDbParameterGroup(params, region);
                 case "ModifyDBParameterGroup" -> handleModifyDbParameterGroup(params, region);
+                case "CopyDBParameterGroup" -> handleCopyDbParameterGroup(params, region);
+                case "ResetDBParameterGroup" -> handleResetDbParameterGroup(params, region);
                 case "DescribeDBParameters" -> handleDescribeDbParameters(params, region);
                 case "CreateDBClusterParameterGroup" -> handleCreateDbClusterParameterGroup(params, region);
                 case "DescribeDBClusterParameterGroups" -> handleDescribeDbClusterParameterGroups(params, region);
                 case "DeleteDBClusterParameterGroup" -> handleDeleteDbClusterParameterGroup(params, region);
                 case "ModifyDBClusterParameterGroup" -> handleModifyDbClusterParameterGroup(params, region);
+                case "CopyDBClusterParameterGroup" -> handleCopyDbClusterParameterGroup(params, region);
+                case "ResetDBClusterParameterGroup" -> handleResetDbClusterParameterGroup(params, region);
                 case "DescribeDBClusterParameters" -> handleDescribeDbClusterParameters(params, region);
                 case "CreateOptionGroup" -> handleCreateOptionGroup(params, region);
+                case "CopyOptionGroup" -> handleCopyOptionGroup(params, region);
                 case "DescribeOptionGroups" -> handleDescribeOptionGroups(params, region);
                 case "ModifyOptionGroup" -> handleModifyOptionGroup(params, region);
                 case "DeleteOptionGroup" -> handleDeleteOptionGroup(params, region);
@@ -806,6 +812,64 @@ public class RdsQueryHandler {
         return parameters;
     }
 
+    private Response handleCopyDbParameterGroup(
+            MultivaluedMap<String, String> params, String region) {
+        String source = params.getFirst("SourceDBParameterGroupIdentifier");
+        String target = params.getFirst("TargetDBParameterGroupIdentifier");
+        String description = params.getFirst("TargetDBParameterGroupDescription");
+        Response missing = firstMissingParam(
+                "SourceDBParameterGroupIdentifier", source,
+                "TargetDBParameterGroupIdentifier", target,
+                "TargetDBParameterGroupDescription", description);
+        if (missing != null) {
+            return missing;
+        }
+        try {
+            DbParameterGroup group = service.copyDbParameterGroup(source, target, description, region);
+            Map<String, String> tags = parseTags(params);
+            if (!tags.isEmpty()) {
+                service.addTagsToResource(group.getDbParameterGroupArn(), tags, region);
+            }
+            return Response.ok(AwsQueryResponse.envelope("CopyDBParameterGroup", AwsNamespaces.RDS,
+                    paramGroupXml(group))).build();
+        } catch (AwsException e) {
+            return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.RDS, e.getHttpStatus());
+        }
+    }
+
+    private Response handleResetDbParameterGroup(
+            MultivaluedMap<String, String> params, String region) {
+        String name = params.getFirst("DBParameterGroupName");
+        if (name == null || name.isBlank()) {
+            return AwsQueryResponse.error("InvalidParameterValue", "DBParameterGroupName is required.", AwsNamespaces.RDS, 400);
+        }
+        try {
+            DbParameterGroup group = service.resetDbParameterGroup(name,
+                    Boolean.parseBoolean(params.getFirst("ResetAllParameters")), parameterNames(params), region);
+            String result = new XmlBuilder()
+                    .elem("DBParameterGroupName", group.getDbParameterGroupName())
+                    .build();
+            return Response.ok(AwsQueryResponse.envelope("ResetDBParameterGroup", AwsNamespaces.RDS, result)).build();
+        } catch (AwsException e) {
+            return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.RDS, e.getHttpStatus());
+        }
+    }
+
+    /** The parameter names of a modify or reset request, in either list encoding. */
+    private static List<String> parameterNames(MultivaluedMap<String, String> params) {
+        List<String> names = new ArrayList<>();
+        for (String prefix : List.of("Parameters.Parameter", "Parameters.member")) {
+            for (int n = 1; ; n++) {
+                String paramName = params.getFirst(prefix + "." + n + ".ParameterName");
+                if (paramName == null) {
+                    break;
+                }
+                names.add(paramName);
+            }
+        }
+        return names;
+    }
+
     private Response handleDescribeDbParameters(
             MultivaluedMap<String, String> params, String region) {
         String name = params.getFirst("DBParameterGroupName");
@@ -903,6 +967,49 @@ public class RdsQueryHandler {
         }
     }
 
+    private Response handleCopyDbClusterParameterGroup(
+            MultivaluedMap<String, String> params, String region) {
+        String source = params.getFirst("SourceDBClusterParameterGroupIdentifier");
+        String target = params.getFirst("TargetDBClusterParameterGroupIdentifier");
+        String description = params.getFirst("TargetDBClusterParameterGroupDescription");
+        Response missing = firstMissingParam(
+                "SourceDBClusterParameterGroupIdentifier", source,
+                "TargetDBClusterParameterGroupIdentifier", target,
+                "TargetDBClusterParameterGroupDescription", description);
+        if (missing != null) {
+            return missing;
+        }
+        try {
+            DbClusterParameterGroup group = service.copyDbClusterParameterGroup(source, target, description, region);
+            Map<String, String> tags = parseTags(params);
+            if (!tags.isEmpty()) {
+                service.addTagsToResource(group.getDbClusterParameterGroupArn(), tags, region);
+            }
+            return Response.ok(AwsQueryResponse.envelope("CopyDBClusterParameterGroup", AwsNamespaces.RDS,
+                    clusterParamGroupXml(group))).build();
+        } catch (AwsException e) {
+            return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.RDS, e.getHttpStatus());
+        }
+    }
+
+    private Response handleResetDbClusterParameterGroup(
+            MultivaluedMap<String, String> params, String region) {
+        String name = params.getFirst("DBClusterParameterGroupName");
+        if (name == null || name.isBlank()) {
+            return AwsQueryResponse.error("InvalidParameterValue", "DBClusterParameterGroupName is required.", AwsNamespaces.RDS, 400);
+        }
+        try {
+            DbClusterParameterGroup group = service.resetDbClusterParameterGroup(name,
+                    Boolean.parseBoolean(params.getFirst("ResetAllParameters")), parameterNames(params), region);
+            String result = new XmlBuilder()
+                    .elem("DBClusterParameterGroupName", group.getDbClusterParameterGroupName())
+                    .build();
+            return Response.ok(AwsQueryResponse.envelope("ResetDBClusterParameterGroup", AwsNamespaces.RDS, result)).build();
+        } catch (AwsException e) {
+            return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.RDS, e.getHttpStatus());
+        }
+    }
+
     private Response handleDescribeDbClusterParameters(
             MultivaluedMap<String, String> params, String region) {
         String name = params.getFirst("DBClusterParameterGroupName");
@@ -946,6 +1053,23 @@ public class RdsQueryHandler {
                 name, engineName, majorEngineVersion, description, parseTags(params), region);
         return Response.ok(AwsQueryResponse.envelope(
                 "CreateOptionGroup", AwsNamespaces.RDS, optionGroupXml(group))).build();
+    }
+
+    private Response handleCopyOptionGroup(
+            MultivaluedMap<String, String> params, String region) {
+        String source = params.getFirst("SourceOptionGroupIdentifier");
+        String target = params.getFirst("TargetOptionGroupIdentifier");
+        String description = params.getFirst("TargetOptionGroupDescription");
+        Response missing = firstMissingParam(
+                "SourceOptionGroupIdentifier", source,
+                "TargetOptionGroupIdentifier", target,
+                "TargetOptionGroupDescription", description);
+        if (missing != null) {
+            return missing;
+        }
+        OptionGroup group = service.copyOptionGroup(source, target, description, parseTags(params), region);
+        return Response.ok(AwsQueryResponse.envelope(
+                "CopyOptionGroup", AwsNamespaces.RDS, optionGroupXml(group))).build();
     }
 
     private Response handleDescribeOptionGroups(
