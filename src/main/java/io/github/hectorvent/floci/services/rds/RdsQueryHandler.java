@@ -31,7 +31,6 @@ import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
 import java.util.Collection;
-import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -771,17 +770,7 @@ public class RdsQueryHandler {
         if (name == null || name.isBlank()) {
             return AwsQueryResponse.error("InvalidParameterValue", "DBParameterGroupName is required.", AwsNamespaces.RDS, 400);
         }
-        Map<String, String> parameters = new HashMap<>();
-        for (int n = 1; ; n++) {
-            String paramName = params.getFirst("Parameters.member." + n + ".ParameterName");
-            if (paramName == null) {
-                break;
-            }
-            String paramValue = params.getFirst("Parameters.member." + n + ".ParameterValue");
-            if (paramValue != null) {
-                parameters.put(paramName, paramValue);
-            }
-        }
+        Map<String, String> parameters = parseParameterOverrides(params);
         try {
             DbParameterGroup group = service.modifyDbParameterGroup(name, parameters, region);
             String result = new XmlBuilder()
@@ -791,6 +780,29 @@ public class RdsQueryHandler {
         } catch (AwsException e) {
             return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.RDS, e.getHttpStatus());
         }
+    }
+
+    /**
+     * Parses the {@code Parameters} list of a modify request. The RDS model declares the list
+     * with {@code locationName: Parameter}, so every SDK and the CLI send
+     * {@code Parameters.Parameter.N.*}; the {@code Parameters.member.N.*} form is the plain Query
+     * encoding older or hand-built callers use, and is accepted as well.
+     */
+    private static Map<String, String> parseParameterOverrides(MultivaluedMap<String, String> params) {
+        Map<String, String> parameters = new LinkedHashMap<>();
+        for (String prefix : List.of("Parameters.Parameter", "Parameters.member")) {
+            for (int n = 1; ; n++) {
+                String paramName = params.getFirst(prefix + "." + n + ".ParameterName");
+                if (paramName == null) {
+                    break;
+                }
+                String paramValue = params.getFirst(prefix + "." + n + ".ParameterValue");
+                if (paramValue != null) {
+                    parameters.put(paramName, paramValue);
+                }
+            }
+        }
+        return parameters;
     }
 
     private Response handleDescribeDbParameters(
@@ -877,17 +889,7 @@ public class RdsQueryHandler {
         if (name == null || name.isBlank()) {
             return AwsQueryResponse.error("InvalidParameterValue", "DBClusterParameterGroupName is required.", AwsNamespaces.RDS, 400);
         }
-        Map<String, String> parameters = new HashMap<>();
-        for (int n = 1; ; n++) {
-            String paramName = params.getFirst("Parameters.member." + n + ".ParameterName");
-            if (paramName == null) {
-                break;
-            }
-            String paramValue = params.getFirst("Parameters.member." + n + ".ParameterValue");
-            if (paramValue != null) {
-                parameters.put(paramName, paramValue);
-            }
-        }
+        Map<String, String> parameters = parseParameterOverrides(params);
         try {
             DbClusterParameterGroup group = service.modifyDbClusterParameterGroup(
                     name, parameters, region);
