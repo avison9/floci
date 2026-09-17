@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.BackupWindows;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.CurrentContainerNetworkResolver;
@@ -37,6 +38,7 @@ import io.github.hectorvent.floci.services.rds.model.DbProxyAuth;
 import io.github.hectorvent.floci.services.rds.model.DbProxyTarget;
 import io.github.hectorvent.floci.services.rds.model.DbProxyTargetGroup;
 import io.github.hectorvent.floci.services.rds.model.RdsEvent;
+import io.github.hectorvent.floci.services.rds.model.ReadReplicaRequest;
 import io.github.hectorvent.floci.services.rds.model.DbSnapshot;
 import io.github.hectorvent.floci.services.rds.model.DbSubnetGroup;
 import io.github.hectorvent.floci.services.rds.model.OptionGroup;
@@ -845,6 +847,335 @@ public class RdsService implements Resettable, ResourceProvider {
         }
 
         return instance;
+    }
+
+    // ── Read replicas ─────────────────────────────────────────────────────────
+
+    static final String READ_REPLICATION_REPLICATING = "replicating";
+    static final String READ_REPLICATION_TERMINATED = "terminated";
+
+    /**
+     * Creates a read replica the way AWS does: a new standalone instance that inherits engine,
+     * version, credentials and database name from the source and, unless the request overrides
+     * them, its instance class, storage and minor version upgrade setting. A same-Region replica
+     * also inherits the source's parameter group, option group, subnet group and security
+     * groups; a cross-Region replica (source named by ARN) gets the Region's defaults, as the
+     * API reference states. Backups start disabled. The two ends are linked the way
+     * DescribeDBInstances reports them: by identifier within a Region, by ARN across Regions.
+     *
+     * <p>The backing database is initialised from a dump of the source taken at creation time,
+     * the same mechanism RestoreDBInstanceFromDBSnapshot uses, so it holds the source's data as
+     * of that moment. Writes made to the source afterwards do not stream to the replica; that is
+     * the follow-up noted in the service docs.
+     */
+    public DbInstance createDbInstanceReadReplica(ReadReplicaRequest request, String region) {
+        String effectiveRegion = effectiveRegion(region);
+        String id = request.dbInstanceIdentifier();
+        if (id == null || id.isBlank()) {
+            throw new AwsException("InvalidParameterValue", "DBInstanceIdentifier is required.", 400);
+        }
+        String sourceRef = request.sourceDbInstanceIdentifier();
+        if (sourceRef == null || sourceRef.isBlank()) {
+            throw new AwsException("InvalidParameterCombination",
+                    "Either SourceDBInstanceIdentifier or SourceDBClusterIdentifier must be specified.", 400);
+        }
+        boolean sourceByArn = sourceRef.startsWith("arn:");
+        if (request.replicaMode() != null && !request.replicaMode().isBlank()) {
+            // ReplicaMode selects mounted or open-read-only for Db2 and Oracle replicas; no
+            // emulated engine is either, so AWS's parameter check applies to all of them.
+            throw new AwsException("InvalidParameterCombination",
+                    "ReplicaMode is supported only for Db2 and Oracle DB instances.", 400);
+        }
+        if (request.dbSubnetGroupName() != null && !request.dbSubnetGroupName().isBlank()
+                && !sourceByArn) {
+            // The API reference's DBSubnetGroupNotAllowedFault: a subnet group goes with a source
+            // named by ARN (another VPC or Region); a plain identifier means the source's VPC.
+            throw new AwsException("DBSubnetGroupNotAllowedFault",
+                    "The DBSubnetGroup shouldn't be specified while creating read replicas that "
+                    + "lie in the same region as the source instance.", 400);
+        }
+
+        DbInstance source = resolveReadReplicaSource(sourceRef, effectiveRegion);
+        String sourceId = source.getDbInstanceIdentifier();
+        String sourceRegion = regionFromArn(source.getDbInstanceArn());
+        boolean sameRegion = sourceRegion.equals(effectiveRegion);
+        if (source.getDbClusterIdentifier() != null && !source.getDbClusterIdentifier().isBlank()) {
+            throw new AwsException("InvalidParameterValue",
+                    "Read replicas of a DB instance that belongs to a DB cluster are not supported. "
+                    + "Add a reader instance to DB cluster " + source.getDbClusterIdentifier()
+                    + " instead.", 400);
+        }
+        if (source.getStatus() != DbInstanceStatus.AVAILABLE) {
+            throw new AwsException("InvalidDBInstanceState",
+                    "DB instance " + sourceId + " is not in available state.", 400);
+        }
+        if (source.getBackupRetentionPeriod() <= 0) {
+            throw new AwsException("InvalidDBInstanceState",
+                    "Automated backups are not enabled for this database instance. To enable "
+                    + "automated backups, use ModifyDBInstance to set the backup retention period "
+                    + "to a non-zero value.", 400);
+        }
+        if (source.getEngine() != DatabaseEngine.POSTGRES) {
+            // CreateDBSnapshot draws the same line: the point-in-time copy is pg_dumpall based.
+            throw new AwsException("InvalidDBInstanceState",
+                    "Operation CreateDBInstanceReadReplica is not supported for engine "
+                    + source.getEngine() + ".", 400);
+        }
+        if (id.equalsIgnoreCase(sourceId) && sameRegion) {
+            throw new AwsException("DBInstanceAlreadyExists",
+                    "DB instance " + id + " already exists.", 400);
+        }
+
+        String engineParam = source.getEngineIdentifier() != null
+                ? source.getEngineIdentifier() : source.getEngine().name().toLowerCase();
+        String dbInstanceClass = firstNonBlank(request.dbInstanceClass(), source.getDbInstanceClass());
+        int allocatedStorage = request.allocatedStorage() != null
+                ? request.allocatedStorage() : source.getAllocatedStorage();
+        boolean iamEnabled = Boolean.TRUE.equals(request.iamDatabaseAuthenticationEnabled());
+        boolean copyTagsToSnapshot = Boolean.TRUE.equals(request.copyTagsToSnapshot());
+        String parameterGroupName = firstNonBlank(
+                request.dbParameterGroupName(), sameRegion ? source.getParameterGroupName() : null);
+        String optionGroupName = firstNonBlank(
+                request.optionGroupName(), sameRegion ? source.getOptionGroupName() : null);
+        String dbSubnetGroupName = firstNonBlank(
+                request.dbSubnetGroupName(), sameRegion ? source.getDbSubnetGroupName() : null);
+        List<String> vpcSecurityGroupIds = request.vpcSecurityGroupIds() != null
+                ? request.vpcSecurityGroupIds()
+                : sameRegion ? source.getVpcSecurityGroupIds() : List.of();
+        boolean autoMinorVersionUpgrade = request.autoMinorVersionUpgrade() != null
+                ? request.autoMinorVersionUpgrade() : source.isAutoMinorVersionUpgrade();
+        // Backups stay off on a replica; the source's windows carry over, and encryption follows
+        // the source because AWS never lets a replica be less protected than what it copies.
+        DbInstanceSettings settings = new DbInstanceSettings(
+                source.isStorageEncrypted() ? Boolean.TRUE : null,
+                source.isStorageEncrypted() && sameRegion ? source.getKmsKeyId() : null,
+                0, source.getPreferredBackupWindow(), source.getPreferredMaintenanceWindow(),
+                copyTagsToSnapshot);
+        Map<String, String> tags = request.tags() != null ? request.tags() : Map.of();
+
+        DbInstance replica = createDbInstance(id, engineParam, source.getEngineVersion(),
+                source.getMasterUsername(), source.getMasterPassword(), source.getDbName(),
+                dbInstanceClass, allocatedStorage, iamEnabled, parameterGroupName,
+                dbSubnetGroupName, null, request.availabilityZone(),
+                Boolean.TRUE.equals(request.multiAz()), false, null, tags, vpcSecurityGroupIds,
+                optionGroupName, effectiveRegion, autoMinorVersionUpgrade, settings,
+                request.publiclyAccessible());
+
+        linkReadReplica(source, replica);
+        if (!config.services().rds().mock()
+                && source.getContainerId() != null && replica.getContainerId() != null) {
+            try {
+                String sqlDump = containerManager.createPostgresSnapshot(
+                        source.getContainerId(), source.getMasterUsername());
+                containerManager.restorePostgresSnapshot(
+                        replica.getContainerId(), replica.getMasterUsername(), sqlDump);
+            } catch (Exception e) {
+                try {
+                    deleteDbInstance(id, effectiveRegion);
+                } catch (RuntimeException cleanupError) {
+                    e.addSuppressed(cleanupError);
+                }
+                AwsException failure = new AwsException("InvalidDBInstanceState",
+                        "Failed to initialise read replica " + id + " from " + sourceId + ": "
+                        + e.getMessage(), 400);
+                failure.initCause(e);
+                throw failure;
+            }
+        }
+        synchronized (this) {
+            replica.setStatus(DbInstanceStatus.AVAILABLE);
+            putInstanceForScope(accountIdFromArn(replica.getDbInstanceArn()), effectiveRegion,
+                    id, replica);
+        }
+        LOG.infov("Read replica {0} of DB instance {1} created", id, sourceId);
+        return replica;
+    }
+
+    /**
+     * Detaches a replica from its source: both links are dropped and automated backups start
+     * with the requested retention (one day when omitted, as on AWS). AWS then reboots the
+     * promoted instance before it is available again, so the same reboot runs here: connections
+     * drop, the container, endpoint and data stay.
+     */
+    public synchronized DbInstance promoteReadReplica(String id, Integer backupRetentionPeriod,
+                                                      String preferredBackupWindow, String region) {
+        String effectiveRegion = effectiveRegion(region);
+        DbInstance replica = getDbInstance(id, effectiveRegion);
+        requireReadReplica(replica);
+        if (replica.getStatus() != DbInstanceStatus.AVAILABLE) {
+            throw new AwsException("InvalidDBInstanceState",
+                    "DB instance " + id + " is not in available state.", 400);
+        }
+        int retention = backupRetentionPeriod != null ? backupRetentionPeriod : 1;
+        if (retention < 0 || retention > 35) {
+            throw new AwsException("InvalidParameterValue",
+                    "Invalid backup retention period: " + retention
+                    + ". Retention period must be between 0 and 35.", 400);
+        }
+        if (retention == 0 && !replica.getReadReplicaDbInstanceIdentifiers().isEmpty()) {
+            // The API reference: "Can't be set to 0 if the DB instance is a source to read replicas."
+            throw new AwsException("InvalidParameterCombination",
+                    "BackupRetentionPeriod can't be set to 0 because DB instance " + id
+                    + " is a source for read replicas.", 400);
+        }
+        String backupWindow = preferredBackupWindow;
+        if (backupWindow != null && !backupWindow.isBlank()) {
+            BackupWindows.parseBackupWindow(backupWindow);
+            String maintenanceWindow = replica.getPreferredMaintenanceWindow() != null
+                    ? replica.getPreferredMaintenanceWindow()
+                    : DbInstanceSettings.DEFAULT_MAINTENANCE_WINDOW;
+            if (DbInstanceSettings.windowsOverlap(backupWindow, maintenanceWindow)) {
+                throw DbInstanceSettings.overlappingWindows();
+            }
+        }
+
+        unlinkReadReplica(replica);
+        replica.setBackupRetentionPeriod(retention);
+        if (backupWindow != null && !backupWindow.isBlank()) {
+            replica.setPreferredBackupWindow(backupWindow);
+        }
+        putInstanceForScope(accountIdFromArn(replica.getDbInstanceArn()), effectiveRegion, id, replica);
+        DbInstance promoted = rebootDbInstance(id, effectiveRegion);
+        LOG.infov("Read replica {0} promoted to a standalone DB instance", id);
+        return promoted;
+    }
+
+    /**
+     * SwitchoverReadReplica swaps an Oracle Data Guard or SQL Server standby with its primary.
+     * The API reference lists only DBInstanceNotFound and InvalidDBInstanceState as its errors,
+     * so a replica of any engine emulated here is refused with the latter.
+     */
+    public synchronized DbInstance switchoverReadReplica(String id, String region) {
+        DbInstance replica = getDbInstance(id, effectiveRegion(region));
+        requireReadReplica(replica);
+        throw new AwsException("InvalidDBInstanceState",
+                "SwitchoverReadReplica is supported only for Oracle and SQL Server read replicas; "
+                + "DB instance " + id + " runs " + replica.getEngine().name().toLowerCase() + ".", 400);
+    }
+
+    /**
+     * PromoteReadReplicaDBCluster applies to an Aurora cluster created as a replica of an RDS
+     * instance (ReplicationSourceIdentifier). No cluster here is created that way, so an existing
+     * cluster is refused the way AWS refuses a cluster that is not a replica.
+     */
+    public synchronized DbCluster promoteReadReplicaDbCluster(String id, String region) {
+        DbCluster cluster = getDbCluster(id, effectiveRegion(region));
+        throw new AwsException("InvalidDBClusterStateFault",
+                "DB cluster " + cluster.getDbClusterIdentifier() + " is not a read replica cluster.", 400);
+    }
+
+    private DbInstance resolveReadReplicaSource(String sourceRef, String requestRegion) {
+        String accountId = currentAccountId();
+        String region = requestRegion;
+        String sourceId = sourceRef;
+        if (sourceRef.startsWith("arn:")) {
+            // A source in another Region is named by ARN; the replica lands in the request Region.
+            String[] parts = sourceRef.split(":", 7);
+            if (parts.length == 7 && "rds".equals(parts[2]) && "db".equals(parts[5])
+                    && accountId.equals(parts[4])) {
+                region = parts[3].isBlank() ? requestRegion : parts[3];
+                sourceId = parts[6];
+            } else {
+                throw new AwsException("DBInstanceNotFound",
+                        "DB instance " + sourceRef + " not found.", 404);
+            }
+        }
+        String resolvedId = sourceId;
+        String resolvedRegion = region;
+        return Optional.ofNullable(findInstanceForScope(accountId, resolvedRegion, resolvedId))
+                .orElseThrow(() -> new AwsException("DBInstanceNotFound",
+                        "DB instance " + resolvedId + " not found.", 404));
+    }
+
+    private static void requireReadReplica(DbInstance instance) {
+        if (!instance.hasReadReplicaSource()) {
+            throw new AwsException("InvalidDBInstanceState",
+                    "DB instance " + instance.getDbInstanceIdentifier() + " is not a read replica.", 400);
+        }
+    }
+
+    /** The other end of a replication link as AWS names it: identifier in-Region, ARN across. */
+    private String replicationLinkName(DbInstance from, DbInstance to) {
+        return regionFromArn(from.getDbInstanceArn()).equals(regionFromArn(to.getDbInstanceArn()))
+                ? to.getDbInstanceIdentifier() : to.getDbInstanceArn();
+    }
+
+    private synchronized void linkReadReplica(DbInstance source, DbInstance replica) {
+        replica.setReadReplicaSourceDbInstanceIdentifier(replicationLinkName(replica, source));
+        replica.setReadReplicationStatus(READ_REPLICATION_REPLICATING);
+        replica.setStatus(DbInstanceStatus.CREATING);
+        putInstanceForScope(accountIdFromArn(replica.getDbInstanceArn()),
+                regionFromArn(replica.getDbInstanceArn()), replica.getDbInstanceIdentifier(), replica);
+        String replicaName = replicationLinkName(source, replica);
+        if (!source.getReadReplicaDbInstanceIdentifiers().contains(replicaName)) {
+            source.getReadReplicaDbInstanceIdentifiers().add(replicaName);
+        }
+        putInstanceForScope(accountIdFromArn(source.getDbInstanceArn()),
+                regionFromArn(source.getDbInstanceArn()), source.getDbInstanceIdentifier(), source);
+    }
+
+    /** Drops the replica's link to its source and the source's link back, if the source exists. */
+    private void unlinkReadReplica(DbInstance replica) {
+        String sourceRef = replica.getReadReplicaSourceDbInstanceIdentifier();
+        replica.setReadReplicaSourceDbInstanceIdentifier(null);
+        replica.setReadReplicationStatus(null);
+        if (sourceRef == null) {
+            return;
+        }
+        String accountId = accountIdFromArn(replica.getDbInstanceArn());
+        DbInstance source = findLinkedInstance(accountId, replica, sourceRef);
+        if (source != null && source.getReadReplicaDbInstanceIdentifiers()
+                .remove(replicationLinkName(source, replica))) {
+            putInstanceForScope(accountId, regionFromArn(source.getDbInstanceArn()),
+                    source.getDbInstanceIdentifier(), source);
+        }
+    }
+
+    /**
+     * Resolves the other end of a replication link: an identifier names an instance in the same
+     * Region as the linking instance, an ARN names one anywhere in the account.
+     */
+    private DbInstance findLinkedInstance(String accountId, DbInstance from, String linkName) {
+        if (linkName.startsWith("arn:")) {
+            for (DbInstance candidate : instances.scan(k -> true)) {
+                if (linkName.equalsIgnoreCase(candidate.getDbInstanceArn())
+                        && accountId.equals(accountIdFromArn(candidate.getDbInstanceArn()))) {
+                    return findInstanceForScope(accountId, regionFromArn(candidate.getDbInstanceArn()),
+                            candidate.getDbInstanceIdentifier());
+                }
+            }
+            return null;
+        }
+        return findInstanceForScope(accountId, regionFromArn(from.getDbInstanceArn()), linkName);
+    }
+
+    /**
+     * Deleting a replica drops it from its source's list. Deleting a source promotes the
+     * same-Region replicas it still has; a cross-Region PostgreSQL replica is not promoted, its
+     * replication status becomes terminated and it waits to be promoted or deleted by hand. Both
+     * are the documented AWS behaviours.
+     */
+    private void detachReadReplicaLinksBeforeDelete(DbInstance instance) {
+        if (instance.hasReadReplicaSource()) {
+            unlinkReadReplica(instance);
+        }
+        String accountId = accountIdFromArn(instance.getDbInstanceArn());
+        for (String replicaName : List.copyOf(instance.getReadReplicaDbInstanceIdentifiers())) {
+            DbInstance replica = findLinkedInstance(accountId, instance, replicaName);
+            if (replica == null || !replicationLinkName(replica, instance)
+                    .equalsIgnoreCase(replica.getReadReplicaSourceDbInstanceIdentifier())) {
+                continue;
+            }
+            if (replicaName.startsWith("arn:")) {
+                replica.setReadReplicationStatus(READ_REPLICATION_TERMINATED);
+            } else {
+                replica.setReadReplicaSourceDbInstanceIdentifier(null);
+                replica.setReadReplicationStatus(null);
+            }
+            putInstanceForScope(accountId, regionFromArn(replica.getDbInstanceArn()),
+                    replica.getDbInstanceIdentifier(), replica);
+        }
+        instance.getReadReplicaDbInstanceIdentifiers().clear();
     }
 
     public Collection<DbSnapshot> describeDbSnapshots(String snapshotId, String instanceId) {
@@ -1935,6 +2266,7 @@ public class RdsService implements Resettable, ResourceProvider {
 
         instance.setStatus(DbInstanceStatus.DELETING);
         putInstanceForScope(currentAccountId(), effectiveRegion, id, instance);
+        detachReadReplicaLinksBeforeDelete(instance);
 
         boolean mock = config.services().rds().mock();
         if (!mock) {

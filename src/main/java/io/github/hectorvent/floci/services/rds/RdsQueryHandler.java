@@ -25,6 +25,7 @@ import io.github.hectorvent.floci.services.rds.model.DbSubnetGroup;
 import io.github.hectorvent.floci.services.rds.model.OptionGroup;
 import io.github.hectorvent.floci.services.rds.model.OptionGroupOption;
 import io.github.hectorvent.floci.services.rds.model.RdsEvent;
+import io.github.hectorvent.floci.services.rds.model.ReadReplicaRequest;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.MultivaluedMap;
@@ -71,6 +72,10 @@ public class RdsQueryHandler {
                 case "DeleteDBInstance" -> handleDeleteDbInstance(params, region);
                 case "ModifyDBInstance" -> handleModifyDbInstance(params, region);
                 case "RebootDBInstance" -> handleRebootDbInstance(params, region);
+                case "CreateDBInstanceReadReplica" -> handleCreateDbInstanceReadReplica(params, region);
+                case "PromoteReadReplica" -> handlePromoteReadReplica(params, region);
+                case "SwitchoverReadReplica" -> handleSwitchoverReadReplica(params, region);
+                case "PromoteReadReplicaDBCluster" -> handlePromoteReadReplicaDbCluster(params, region);
                 case "DescribeOrderableDBInstanceOptions" -> handleDescribeOrderableDbInstanceOptions(params);
                 case "DescribeEvents" -> handleDescribeEvents(params, region);
                 case "CreateDBSubnetGroup" -> handleCreateDbSubnetGroup(params, region);
@@ -549,6 +554,84 @@ public class RdsQueryHandler {
             DbInstance instance = service.rebootDbInstance(id, region);
             String result = dbInstanceXml(instance);
             return Response.ok(AwsQueryResponse.envelope("RebootDBInstance", AwsNamespaces.RDS, result)).build();
+        } catch (AwsException e) {
+            return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.RDS, e.getHttpStatus());
+        }
+    }
+
+    // ── Read replicas ─────────────────────────────────────────────────────────
+
+    private Response handleCreateDbInstanceReadReplica(
+            MultivaluedMap<String, String> params, String region) {
+        String id = params.getFirst("DBInstanceIdentifier");
+        if (id == null || id.isBlank()) {
+            return AwsQueryResponse.error("InvalidParameterValue", "DBInstanceIdentifier is required.", AwsNamespaces.RDS, 400);
+        }
+        try {
+            ReadReplicaRequest request = new ReadReplicaRequest(
+                    id,
+                    params.getFirst("SourceDBInstanceIdentifier"),
+                    params.getFirst("DBInstanceClass"),
+                    params.getFirst("AvailabilityZone"),
+                    parseOptionalBoolean(params, "MultiAZ"),
+                    parseOptionalBoolean(params, "AutoMinorVersionUpgrade"),
+                    params.getFirst("OptionGroupName"),
+                    params.getFirst("DBParameterGroupName"),
+                    parseOptionalBoolean(params, "PubliclyAccessible"),
+                    params.getFirst("DBSubnetGroupName"),
+                    hasMemberKeys(params, "VpcSecurityGroupIds") ? vpcSecurityGroupIds(params) : null,
+                    parseOptionalBoolean(params, "CopyTagsToSnapshot"),
+                    parseOptionalBoolean(params, "EnableIAMDatabaseAuthentication"),
+                    optionalInt(params.getFirst("AllocatedStorage")),
+                    params.getFirst("ReplicaMode"),
+                    parseTags(params));
+            DbInstance replica = service.createDbInstanceReadReplica(request, region);
+            return Response.ok(AwsQueryResponse.envelope(
+                    "CreateDBInstanceReadReplica", AwsNamespaces.RDS, dbInstanceXml(replica))).build();
+        } catch (AwsException e) {
+            return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.RDS, e.getHttpStatus());
+        }
+    }
+
+    private Response handlePromoteReadReplica(MultivaluedMap<String, String> params, String region) {
+        String id = params.getFirst("DBInstanceIdentifier");
+        if (id == null || id.isBlank()) {
+            return AwsQueryResponse.error("InvalidParameterValue", "DBInstanceIdentifier is required.", AwsNamespaces.RDS, 400);
+        }
+        try {
+            DbInstance instance = service.promoteReadReplica(id,
+                    optionalInt(params.getFirst("BackupRetentionPeriod")),
+                    params.getFirst("PreferredBackupWindow"), region);
+            return Response.ok(AwsQueryResponse.envelope(
+                    "PromoteReadReplica", AwsNamespaces.RDS, dbInstanceXml(instance))).build();
+        } catch (AwsException e) {
+            return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.RDS, e.getHttpStatus());
+        }
+    }
+
+    private Response handleSwitchoverReadReplica(MultivaluedMap<String, String> params, String region) {
+        String id = params.getFirst("DBInstanceIdentifier");
+        if (id == null || id.isBlank()) {
+            return AwsQueryResponse.error("InvalidParameterValue", "DBInstanceIdentifier is required.", AwsNamespaces.RDS, 400);
+        }
+        try {
+            DbInstance instance = service.switchoverReadReplica(id, region);
+            return Response.ok(AwsQueryResponse.envelope(
+                    "SwitchoverReadReplica", AwsNamespaces.RDS, dbInstanceXml(instance))).build();
+        } catch (AwsException e) {
+            return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.RDS, e.getHttpStatus());
+        }
+    }
+
+    private Response handlePromoteReadReplicaDbCluster(MultivaluedMap<String, String> params, String region) {
+        String id = params.getFirst("DBClusterIdentifier");
+        if (id == null || id.isBlank()) {
+            return AwsQueryResponse.error("InvalidParameterValue", "DBClusterIdentifier is required.", AwsNamespaces.RDS, 400);
+        }
+        try {
+            DbCluster cluster = service.promoteReadReplicaDbCluster(id, region);
+            return Response.ok(AwsQueryResponse.envelope(
+                    "PromoteReadReplicaDBCluster", AwsNamespaces.RDS, dbClusterXml(cluster))).build();
         } catch (AwsException e) {
             return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.RDS, e.getHttpStatus());
         }
@@ -1547,9 +1630,41 @@ public class RdsQueryHandler {
         if (i.getDbClusterIdentifier() != null && !i.getDbClusterIdentifier().isBlank()) {
             xml.elem("DBClusterIdentifier", i.getDbClusterIdentifier());
         }
+        xml.raw(readReplicaXml(i));
         xml.start("TagList");
         writeTags(xml, i.getTags());
         xml.end("TagList");
+        return xml.build();
+    }
+
+    /**
+     * The replication links as DescribeDBInstances reports them: the replica list is always
+     * present (empty on a standalone), the source and the "read replication" status entry only
+     * on a replica. Message is blank unless the entry reports an error, and terminated (the
+     * cross-Region source is gone) is the one non-normal state modelled.
+     */
+    private static String readReplicaXml(DbInstance i) {
+        XmlBuilder xml = new XmlBuilder();
+        if (i.hasReadReplicaSource()) {
+            xml.elem("ReadReplicaSourceDBInstanceIdentifier", i.getReadReplicaSourceDbInstanceIdentifier());
+        }
+        xml.start("ReadReplicaDBInstanceIdentifiers");
+        for (String replicaId : i.getReadReplicaDbInstanceIdentifiers()) {
+            xml.elem("ReadReplicaDBInstanceIdentifier", replicaId);
+        }
+        xml.end("ReadReplicaDBInstanceIdentifiers");
+        if (i.hasReadReplicaSource()) {
+            String status = i.getReadReplicationStatus() != null
+                    ? i.getReadReplicationStatus() : RdsService.READ_REPLICATION_REPLICATING;
+            xml.start("StatusInfos")
+                    .start("DBInstanceStatusInfo")
+                    .elem("StatusType", "read replication")
+                    .elem("Normal", RdsService.READ_REPLICATION_REPLICATING.equals(status))
+                    .elem("Status", status)
+                    .elem("Message", "")
+                    .end("DBInstanceStatusInfo")
+                    .end("StatusInfos");
+        }
         return xml.build();
     }
 

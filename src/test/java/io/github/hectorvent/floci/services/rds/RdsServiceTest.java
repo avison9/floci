@@ -32,6 +32,7 @@ import io.github.hectorvent.floci.services.rds.model.DbSubnetGroup;
 import io.github.hectorvent.floci.services.rds.model.OptionGroup;
 import io.github.hectorvent.floci.services.rds.model.OptionGroupOption;
 import io.github.hectorvent.floci.services.rds.model.RdsEvent;
+import io.github.hectorvent.floci.services.rds.model.ReadReplicaRequest;
 import io.github.hectorvent.floci.services.rds.proxy.RdsAuthProxy;
 import io.github.hectorvent.floci.services.rds.proxy.RdsProxyManager;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
@@ -6453,5 +6454,266 @@ class RdsServiceTest {
         assertNull(modifyOutcome.get(), "modify completed before the delete");
         assertThrows(AwsException.class, () -> service.getDbInstance("mydb"),
                 "the deleted instance must not come back from the modify");
+    }
+
+    // ── Read replicas ─────────────────────────────────────────────────────────
+
+    private DbInstance createPostgresSource(String id) {
+        return rdsService.createDbInstance(id, "postgres", "16.3",
+                "admin", "password", "appdb", "db.t3.medium",
+                50, false, null, null, null, null, false);
+    }
+
+    private static ReadReplicaRequest replicaRequest(String id, String source) {
+        return new ReadReplicaRequest(id, source, null, null, null, null, null, null, null,
+                null, null, null, null, null, null, Map.of());
+    }
+
+    @Test
+    void createReadReplicaInheritsTheSourceAndLinksBothEnds() {
+        when(containerManager.tryStart(any(), any(), any(), any(), any(), any(), any(), any(), any()))
+                .thenAnswer(invocation -> new RdsContainerHandle(
+                        "cont-" + invocation.getArgument(1), invocation.getArgument(1), "localhost", 5432));
+        createPostgresSource("primary");
+        when(containerManager.createPostgresSnapshot("cont-primary", "admin")).thenReturn("DUMP");
+
+        DbInstance replica = rdsService.createDbInstanceReadReplica(
+                replicaRequest("primary-replica", "primary"), null);
+
+        assertEquals("primary", replica.getReadReplicaSourceDbInstanceIdentifier());
+        assertTrue(replica.hasReadReplicaSource());
+        assertEquals(DatabaseEngine.POSTGRES, replica.getEngine());
+        assertEquals("16.3", replica.getEngineVersion());
+        assertEquals("admin", replica.getMasterUsername());
+        assertEquals("password", replica.getMasterPassword());
+        assertEquals("appdb", replica.getDbName());
+        assertEquals("db.t3.medium", replica.getDbInstanceClass());
+        assertEquals(50, replica.getAllocatedStorage());
+        assertEquals(0, replica.getBackupRetentionPeriod(), "a replica starts with backups off");
+        assertEquals(DbInstanceStatus.AVAILABLE, replica.getStatus());
+        assertNotEquals(rdsService.getDbInstance("primary").getEndpoint().port(),
+                replica.getEndpoint().port(), "a replica has its own endpoint");
+        assertEquals(List.of("primary-replica"),
+                rdsService.getDbInstance("primary").getReadReplicaDbInstanceIdentifiers());
+        // The backing copy is a dump of the source restored into the replica's own container.
+        verify(containerManager).restorePostgresSnapshot("cont-primary-replica", "admin", "DUMP");
+    }
+
+    @Test
+    void createReadReplicaHonoursOverridesAndResolvesAnArnSource() {
+        createPostgresSource("primary");
+        when(containerManager.createPostgresSnapshot(any(), eq("admin"))).thenReturn("DUMP");
+
+        DbInstance replica = rdsService.createDbInstanceReadReplica(new ReadReplicaRequest(
+                "big-replica", "arn:aws:rds:us-east-1:123456789012:db:primary",
+                "db.r6g.large", "us-east-1b", false, false, null, null, true, null,
+                List.of("sg-replica"), true, true, 100, null, Map.of("role", "reader")), null);
+
+        assertEquals("primary", replica.getReadReplicaSourceDbInstanceIdentifier(),
+                "a same-Region source named by ARN is still reported by identifier");
+        assertEquals("db.r6g.large", replica.getDbInstanceClass());
+        assertEquals(100, replica.getAllocatedStorage());
+        assertEquals("us-east-1b", replica.getAvailabilityZone());
+        assertFalse(replica.isMultiAz());
+        assertFalse(replica.isAutoMinorVersionUpgrade());
+        assertTrue(replica.isPubliclyAccessible());
+        assertTrue(replica.isIamDatabaseAuthenticationEnabled());
+        assertTrue(replica.isCopyTagsToSnapshot());
+        assertEquals(List.of("sg-replica"), replica.getVpcSecurityGroupIds());
+        assertEquals(Map.of("role", "reader"), replica.getTags());
+    }
+
+    @Test
+    void sameRegionReplicaInheritsGroupsAndCrossRegionReplicaGetsDefaultsAndArnLinks() {
+        rdsService.createDbParameterGroup("primary-pg", "postgres16", "source group");
+        rdsService.createDbInstance("primary", "postgres", "16.3", "admin", "password", "appdb",
+                "db.t3.medium", 50, true, "primary-pg", null, null, null, false, false, null,
+                Map.of(), List.of("sg-source"), null, null, true,
+                new DbInstanceSettings(null, null, null, null, null, true));
+        when(containerManager.createPostgresSnapshot(any(), eq("admin"))).thenReturn("DUMP");
+
+        DbInstance local = rdsService.createDbInstanceReadReplica(
+                replicaRequest("local-replica", "primary"), null);
+        assertEquals("primary-pg", local.getParameterGroupName());
+        assertEquals(List.of("sg-source"), local.getVpcSecurityGroupIds());
+        assertFalse(local.isIamDatabaseAuthenticationEnabled(),
+                "IAM authentication is off unless the request enables it");
+        assertFalse(local.isCopyTagsToSnapshot(), "tags are not copied unless the request says so");
+
+        DbInstance remote = rdsService.createDbInstanceReadReplica(
+                replicaRequest("remote-replica", "arn:aws:rds:us-east-1:123456789012:db:primary"),
+                "eu-west-1");
+        assertEquals("arn:aws:rds:eu-west-1:123456789012:db:remote-replica", remote.getDbInstanceArn());
+        assertEquals("arn:aws:rds:us-east-1:123456789012:db:primary",
+                remote.getReadReplicaSourceDbInstanceIdentifier(),
+                "a cross-Region link names the source by ARN");
+        assertNull(remote.getParameterGroupName(), "a cross-Region replica gets the default group");
+        assertTrue(remote.getVpcSecurityGroupIds().isEmpty(), "and the default security group");
+        assertEquals(List.of("local-replica", "arn:aws:rds:eu-west-1:123456789012:db:remote-replica"),
+                rdsService.getDbInstance("primary").getReadReplicaDbInstanceIdentifiers());
+
+        // A subnet group goes with a source named by ARN; with a plain identifier AWS refuses it.
+        AwsException subnetGroup = assertThrows(AwsException.class, () ->
+                rdsService.createDbInstanceReadReplica(new ReadReplicaRequest("third", "primary",
+                        null, null, null, null, null, null, null, "some-subnet-group", null, null,
+                        null, null, null, Map.of()), null));
+        assertEquals("DBSubnetGroupNotAllowedFault", subnetGroup.getErrorCode());
+    }
+
+    @Test
+    void createReadReplicaRefusesWhatAwsRefuses() {
+        createPostgresSource("primary");
+        rdsService.createDbInstance("nobackups", "postgres", "16.3", "admin", "password", "appdb",
+                "db.t3.micro", 20, false, null, null, null, null, false, false, null,
+                Map.of(), List.of(), null, null, true,
+                new DbInstanceSettings(null, null, 0, null, null, null));
+        rdsService.createDbInstance("maria", "mariadb", "11.2", "admin", "password", "appdb",
+                "db.t3.micro", 20, false, null, null, null, null, false);
+
+        AwsException noSource = assertThrows(AwsException.class, () ->
+                rdsService.createDbInstanceReadReplica(replicaRequest("r", null), null));
+        assertEquals("InvalidParameterCombination", noSource.getErrorCode());
+
+        AwsException unknown = assertThrows(AwsException.class, () ->
+                rdsService.createDbInstanceReadReplica(replicaRequest("r", "missing"), null));
+        assertEquals("DBInstanceNotFound", unknown.getErrorCode());
+
+        AwsException backupsOff = assertThrows(AwsException.class, () ->
+                rdsService.createDbInstanceReadReplica(replicaRequest("r", "nobackups"), null));
+        assertEquals("InvalidDBInstanceState", backupsOff.getErrorCode());
+        assertTrue(backupsOff.getMessage().contains("Automated backups are not enabled"));
+
+        AwsException otherEngine = assertThrows(AwsException.class, () ->
+                rdsService.createDbInstanceReadReplica(replicaRequest("r", "maria"), null));
+        assertEquals("InvalidDBInstanceState", otherEngine.getErrorCode());
+
+        AwsException replicaMode = assertThrows(AwsException.class, () ->
+                rdsService.createDbInstanceReadReplica(new ReadReplicaRequest("r", "primary",
+                        null, null, null, null, null, null, null, null, null, null, null, null,
+                        "mounted", Map.of()), null));
+        assertEquals("InvalidParameterCombination", replicaMode.getErrorCode());
+
+        AwsException sameName = assertThrows(AwsException.class, () ->
+                rdsService.createDbInstanceReadReplica(replicaRequest("primary", "primary"), null));
+        assertEquals("DBInstanceAlreadyExists", sameName.getErrorCode());
+        assertTrue(rdsService.getDbInstance("primary").getReadReplicaDbInstanceIdentifiers().isEmpty(),
+                "a refused request leaves no dangling link on the source");
+    }
+
+    @Test
+    void createReadReplicaRollsBackWhenTheCopyFails() {
+        createPostgresSource("primary");
+        when(containerManager.createPostgresSnapshot(any(), eq("admin"))).thenReturn("DUMP");
+        doThrow(new RuntimeException("restore exploded"))
+                .when(containerManager).restorePostgresSnapshot(any(), eq("admin"), eq("DUMP"));
+
+        AwsException failure = assertThrows(AwsException.class, () ->
+                rdsService.createDbInstanceReadReplica(replicaRequest("primary-replica", "primary"), null));
+
+        assertEquals("InvalidDBInstanceState", failure.getErrorCode());
+        assertTrue(failure.getMessage().contains("restore exploded"));
+        assertThrows(AwsException.class, () -> rdsService.getDbInstance("primary-replica"));
+        assertTrue(rdsService.getDbInstance("primary").getReadReplicaDbInstanceIdentifiers().isEmpty());
+    }
+
+    @Test
+    void promoteReadReplicaDetachesItAndTurnsBackupsOn() {
+        createPostgresSource("primary");
+        when(containerManager.createPostgresSnapshot(any(), eq("admin"))).thenReturn("DUMP");
+        rdsService.createDbInstanceReadReplica(replicaRequest("primary-replica", "primary"), null);
+
+        DbInstance promoted = rdsService.promoteReadReplica("primary-replica", 7, "03:00-03:30", null);
+
+        assertFalse(promoted.hasReadReplicaSource());
+        assertNull(promoted.getReadReplicationStatus());
+        assertEquals(7, promoted.getBackupRetentionPeriod());
+        assertEquals("03:00-03:30", promoted.getPreferredBackupWindow());
+        assertEquals(DbInstanceStatus.AVAILABLE, promoted.getStatus());
+        assertTrue(rdsService.getDbInstance("primary").getReadReplicaDbInstanceIdentifiers().isEmpty());
+        assertFalse(rdsService.getDbInstance("primary-replica").hasReadReplicaSource());
+        // AWS reboots the promoted instance before it is available again.
+        verify(containerManager).stop(any());
+        verify(containerManager, times(3)).tryStart(any(), any(), any(), any(), any(), any(), any(), any(), any());
+
+        // Omitted retention means one day, as on AWS; a standalone instance cannot be promoted.
+        rdsService.createDbInstanceReadReplica(replicaRequest("second-replica", "primary"), null);
+        assertEquals(1, rdsService.promoteReadReplica("second-replica", null, null, null)
+                .getBackupRetentionPeriod());
+        AwsException notReplica = assertThrows(AwsException.class, () ->
+                rdsService.promoteReadReplica("primary", null, null, null));
+        assertEquals("InvalidDBInstanceState", notReplica.getErrorCode());
+        AwsException badRetention = assertThrows(AwsException.class, () -> {
+            rdsService.createDbInstanceReadReplica(replicaRequest("third-replica", "primary"), null);
+            rdsService.promoteReadReplica("third-replica", 36, null, null);
+        });
+        assertEquals("InvalidParameterValue", badRetention.getErrorCode());
+        assertTrue(rdsService.getDbInstance("third-replica").hasReadReplicaSource(),
+                "a refused promotion leaves the replica attached");
+
+        // A replica that has replicas of its own (backups on, as AWS requires of any source)
+        // cannot turn backups off when promoted.
+        rdsService.modifyDbInstance("third-replica", null, null, null, null, null, null, null,
+                new DbInstanceSettings(null, null, 3, null, null, null), null);
+        rdsService.createDbInstanceReadReplica(replicaRequest("cascade", "third-replica"), null);
+        AwsException zeroWithReplicas = assertThrows(AwsException.class, () ->
+                rdsService.promoteReadReplica("third-replica", 0, null, null));
+        assertEquals("InvalidParameterCombination", zeroWithReplicas.getErrorCode());
+    }
+
+    @Test
+    void deletingEitherEndOfAReplicationLinkDropsTheLink() {
+        createPostgresSource("primary");
+        when(containerManager.createPostgresSnapshot(any(), eq("admin"))).thenReturn("DUMP");
+        rdsService.createDbInstanceReadReplica(replicaRequest("replica-a", "primary"), null);
+        rdsService.createDbInstanceReadReplica(replicaRequest("replica-b", "primary"), null);
+
+        rdsService.deleteDbInstance("replica-a");
+        assertEquals(List.of("replica-b"),
+                rdsService.getDbInstance("primary").getReadReplicaDbInstanceIdentifiers());
+
+        rdsService.createDbInstanceReadReplica(
+                replicaRequest("replica-c", "arn:aws:rds:us-east-1:123456789012:db:primary"),
+                "eu-west-1");
+
+        // Deleting the source promotes the same-Region replica; the cross-Region PostgreSQL
+        // replica keeps its link with replication terminated, both as AWS documents.
+        rdsService.deleteDbInstance("primary");
+        DbInstance promoted = rdsService.getDbInstance("replica-b");
+        assertFalse(promoted.hasReadReplicaSource());
+        assertEquals(DbInstanceStatus.AVAILABLE, promoted.getStatus());
+        DbInstance terminated = rdsService.getDbInstance("replica-c", "eu-west-1");
+        assertEquals("arn:aws:rds:us-east-1:123456789012:db:primary",
+                terminated.getReadReplicaSourceDbInstanceIdentifier());
+        assertEquals(RdsService.READ_REPLICATION_TERMINATED, terminated.getReadReplicationStatus());
+        // It can still be promoted by hand.
+        assertFalse(rdsService.promoteReadReplica("replica-c", null, null, "eu-west-1")
+                .hasReadReplicaSource());
+    }
+
+    @Test
+    void switchoverAndClusterPromotionAnswerWithTheApiReferenceErrors() {
+        createPostgresSource("primary");
+        when(containerManager.createPostgresSnapshot(any(), eq("admin"))).thenReturn("DUMP");
+        rdsService.createDbInstanceReadReplica(replicaRequest("primary-replica", "primary"), null);
+
+        AwsException missing = assertThrows(AwsException.class, () ->
+                rdsService.switchoverReadReplica("nope", null));
+        assertEquals("DBInstanceNotFound", missing.getErrorCode());
+        AwsException standalone = assertThrows(AwsException.class, () ->
+                rdsService.switchoverReadReplica("primary", null));
+        assertEquals("InvalidDBInstanceState", standalone.getErrorCode());
+        AwsException engine = assertThrows(AwsException.class, () ->
+                rdsService.switchoverReadReplica("primary-replica", null));
+        assertEquals("InvalidDBInstanceState", engine.getErrorCode());
+        assertTrue(engine.getMessage().contains("Oracle"));
+
+        AwsException noCluster = assertThrows(AwsException.class, () ->
+                rdsService.promoteReadReplicaDbCluster("nope", null));
+        assertEquals("DBClusterNotFoundFault", noCluster.getErrorCode());
+        rdsService.createDbCluster("aurora", "aurora-postgresql", "16.3",
+                "admin", "password", "appdb", false, null);
+        AwsException notReplicaCluster = assertThrows(AwsException.class, () ->
+                rdsService.promoteReadReplicaDbCluster("aurora", null));
+        assertEquals("InvalidDBClusterStateFault", notReplicaCluster.getErrorCode());
     }
 }
