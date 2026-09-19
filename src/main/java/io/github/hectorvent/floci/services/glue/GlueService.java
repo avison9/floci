@@ -80,6 +80,7 @@ public class GlueService {
     private static final int MAX_CONNECTION_DESCRIPTION_LENGTH = 2048;
     private static final int MAX_CONNECTION_MATCH_CRITERIA = 10;
     private static final int MAX_CONNECTION_PROPERTIES = 100;
+    private static final int MAX_BATCH_DELETE_CONNECTIONS = 25;
     private static final Set<String> CONNECTION_TYPES = Set.of(
             "JDBC", "SFTP", "MONGODB", "KAFKA", "NETWORK", "MARKETPLACE", "CUSTOM", "SALESFORCE",
             "VIEW_VALIDATION_REDSHIFT", "VIEW_VALIDATION_ATHENA", "GOOGLEADS", "GOOGLESHEETS",
@@ -2028,6 +2029,10 @@ public class GlueService {
     /** Deletes what it can; the names that could not be deleted come back keyed in the errors map. */
     public BatchDeleteConnectionResult batchDeleteConnections(List<String> names, String region) {
         validateRequired(names, "ConnectionNameList");
+        if (names.size() > MAX_BATCH_DELETE_CONNECTIONS) {
+            throw new AwsException("InvalidInputException",
+                    "ConnectionNameList must have at most " + MAX_BATCH_DELETE_CONNECTIONS + " items.", 400);
+        }
         List<String> succeeded = new ArrayList<>();
         Map<String, ErrorDetail> errors = new LinkedHashMap<>();
         for (String name : names) {

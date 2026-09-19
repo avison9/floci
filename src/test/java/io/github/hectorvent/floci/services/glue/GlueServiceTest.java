@@ -39,6 +39,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.IntStream;
 import java.util.concurrent.CountDownLatch;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -1390,7 +1391,7 @@ class GlueServiceTest {
         assertEquals("plain", errors.get(0).tableName());
         assertEquals(1, glueService.getTableVersions("db1", "plain").size(), "only the current version is left");
 
-        List<String> tooMany = java.util.stream.IntStream.rangeClosed(1, 101)
+        List<String> tooMany = IntStream.rangeClosed(1, 101)
                 .mapToObj(String::valueOf).toList();
         AwsException overCap = assertThrows(AwsException.class,
                 () -> glueService.batchDeleteTableVersions("db1", "plain", tooMany));
@@ -1681,6 +1682,11 @@ class GlueServiceTest {
         assertEquals(1, result.errors().size());
         assertEquals("EntityNotFoundException", result.errors().get("absent").errorCode());
         assertTrue(glueService.getConnections(null, null, null, false, null, null).items().isEmpty());
+
+        // The reference caps ConnectionNameList at 25 entries.
+        List<String> twentySix = IntStream.rangeClosed(1, 26).mapToObj(i -> "c" + i).toList();
+        assertEquals("InvalidInputException",
+                assertThrows(AwsException.class, () -> glueService.batchDeleteConnections(twentySix, REGION)).getErrorCode());
     }
 
     @Test

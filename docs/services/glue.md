@@ -73,7 +73,7 @@ only arises from a backfill failure.
 | GetConnections | Lists connections, narrowed by `Filter.MatchCriteria`, `Filter.ConnectionType` and `Filter.ConnectionSchemaVersion`, paged by `MaxResults` and `NextToken`. |
 | UpdateConnection | Redefines a connection from a full `ConnectionInput`, as on AWS: members left out of the input are dropped; the name and `CreationTime` are kept. |
 | DeleteConnection | Deletes a connection and its tags. |
-| BatchDeleteConnection | Deletes several connections, reporting the ones not found in `Errors`. |
+| BatchDeleteConnection | Deletes up to 25 connections, reporting the ones not found in `Errors`. |
 | TestConnection | Accepts a connection name or an inline `TestConnectionInput` and answers with an empty body. |
 
 `ConnectionInput` is validated against the API reference: `Name` (1 to 255 characters), `ConnectionType`
@@ -82,6 +82,11 @@ empty for a `NETWORK` connection) are required; `MatchCriteria` holds at most 10
 under `AuthenticationConfiguration` are accepted and never returned by a read. A connection that uses
 `AuthenticationConfiguration` or the `SparkProperties`, `AthenaProperties` or `PythonProperties` maps reports
 `ConnectionSchemaVersion` 2; the classic JDBC, Kafka and network shape reports 1.
+
+`HidePassword` removes `PASSWORD` and `ENCRYPTED_PASSWORD`, the two members the API reference defines as the
+connection's password. The Kafka credentials (`KAFKA_CLIENT_KEYSTORE_PASSWORD`, `KAFKA_CLIENT_KEY_PASSWORD`,
+`KAFKA_SASL_PLAIN_PASSWORD`, `KAFKA_SASL_SCRAM_PASSWORD` and their `ENCRYPTED_` forms) are returned as stored: the
+reference does not say whether the flag covers them, so Floci does not guess.
 
 `TestConnection` is asynchronous on AWS and returns nothing; Floci checks the request's shape and accepts it
 without opening a socket to the data store, since no job or crawler runs against a connection yet.
