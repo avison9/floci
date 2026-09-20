@@ -21,6 +21,7 @@ import software.amazon.awssdk.services.glue.model.ConnectionInput;
 import software.amazon.awssdk.services.glue.model.ConnectionPropertyKey;
 import software.amazon.awssdk.services.glue.model.ConnectionType;
 import software.amazon.awssdk.services.glue.model.CreateConnectionRequest;
+import software.amazon.awssdk.services.glue.model.DataCatalogEncryptionSettings;
 import software.amazon.awssdk.services.glue.model.CreateConnectionResponse;
 import software.amazon.awssdk.services.glue.model.DeleteConnectionRequest;
 import software.amazon.awssdk.services.glue.model.GetConnectionRequest;
@@ -691,7 +692,7 @@ class GlueCatalogTest {
         assertThatThrownBy(() -> glue.getResourcePolicy(GetResourcePolicyRequest.builder().build()))
                 .isInstanceOf(EntityNotFoundException.class);
 
-        var settings = glue.getDataCatalogEncryptionSettings(GetDataCatalogEncryptionSettingsRequest.builder().build())
+        DataCatalogEncryptionSettings settings = glue.getDataCatalogEncryptionSettings(GetDataCatalogEncryptionSettingsRequest.builder().build())
                 .dataCatalogEncryptionSettings();
         assertThat(settings.encryptionAtRest().catalogEncryptionModeAsString()).isEqualTo("DISABLED");
         assertThat(settings.connectionPasswordEncryption().returnConnectionPasswordEncrypted()).isFalse();

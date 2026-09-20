@@ -118,9 +118,11 @@ the API. `ConnectionPasswordEncryption` is applied: while `ReturnConnectionPassw
 created or updated has each password property encrypted with `AwsKmsKeyId` through Floci's KMS and stored under the
 name the `Connection` structure documents for it (`PASSWORD` as `ENCRYPTED_PASSWORD`, and the four Kafka passwords as
 their `ENCRYPTED_KAFKA_*` forms). Reads return the ciphertext, base64-encoded, which `KMS.Decrypt` turns back into
-the password. A missing key, or none configured, fails the create or update with `GlueEncryptionException`, as on AWS.
-Connections created before the setting was switched on keep their plaintext, also as on AWS, where the choice is made
-when the connection is created or updated.
+the password. A missing key, or none configured, fails the create or update with `GlueEncryptionException`, the error
+`CreateConnection` and `UpdateConnection` list for a failed encryption operation. Connections created before the setting
+was switched on keep their plaintext: the developer guide ("Encrypting connection passwords") states that whether a
+password is encrypted "was determined when the connection was created or updated", so the setting is not applied
+retroactively.
 
 #### Jobs
 
