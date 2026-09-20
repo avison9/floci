@@ -7,6 +7,14 @@ import org.junit.jupiter.api.Test;
 import software.amazon.awssdk.services.glue.GlueClient;
 import software.amazon.awssdk.services.glue.model.BatchCreatePartitionRequest;
 import software.amazon.awssdk.services.glue.model.BatchDeleteConnectionRequest;
+import software.amazon.awssdk.services.glue.model.ConditionCheckFailureException;
+import software.amazon.awssdk.services.glue.model.DeleteResourcePolicyRequest;
+import software.amazon.awssdk.services.glue.model.ExistCondition;
+import software.amazon.awssdk.services.glue.model.GetResourcePoliciesRequest;
+import software.amazon.awssdk.services.glue.model.GetResourcePolicyRequest;
+import software.amazon.awssdk.services.glue.model.GetResourcePolicyResponse;
+import software.amazon.awssdk.services.glue.model.GetDataCatalogEncryptionSettingsRequest;
+import software.amazon.awssdk.services.glue.model.PutResourcePolicyRequest;
 import software.amazon.awssdk.services.glue.model.BatchDeleteConnectionResponse;
 import software.amazon.awssdk.services.glue.model.Connection;
 import software.amazon.awssdk.services.glue.model.ConnectionInput;
@@ -638,6 +646,55 @@ class GlueCatalogTest {
                 .build());
         assertThat(batch.succeeded()).containsExactly(KAFKA_CONNECTION_NAME);
         assertThat(batch.errors()).containsOnlyKeys(CONNECTION_NAME);
+    }
+
+    @Test
+    @DisplayName("The catalog resource policy follows the create, update and delete conditions Terraform sends")
+    void catalogResourcePolicyLifecycle() {
+        String policy = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
+                + "\"Principal\":{\"AWS\":\"arn:aws:iam::111122223333:root\"},\"Action\":\"glue:GetTable\",\"Resource\":\"*\"}]}";
+        String policyV2 = policy.replace("glue:GetTable", "glue:GetTables");
+        // Start from no policy; the catalog is shared with other tests.
+        try {
+            glue.deleteResourcePolicy(DeleteResourcePolicyRequest.builder().build());
+        }
+        catch (EntityNotFoundException ignored) {}
+
+        String hash = glue.putResourcePolicy(PutResourcePolicyRequest.builder()
+                .policyInJson(policy)
+                .policyExistsCondition(ExistCondition.NOT_EXIST)
+                .build()).policyHash();
+        GetResourcePolicyResponse read = glue.getResourcePolicy(GetResourcePolicyRequest.builder().build());
+        assertThat(read.policyInJson()).isEqualTo(policy);
+        assertThat(read.policyHash()).isEqualTo(hash);
+        assertThat(read.createTime()).isNotNull();
+        assertThat(read.updateTime()).isNotNull();
+
+        assertThatThrownBy(() -> glue.putResourcePolicy(PutResourcePolicyRequest.builder()
+                .policyInJson(policyV2)
+                .policyExistsCondition(ExistCondition.NOT_EXIST)
+                .build()))
+                .isInstanceOf(ConditionCheckFailureException.class);
+
+        String hash2 = glue.putResourcePolicy(PutResourcePolicyRequest.builder()
+                .policyInJson(policyV2)
+                .policyExistsCondition(ExistCondition.MUST_EXIST)
+                .policyHashCondition(hash)
+                .build()).policyHash();
+        assertThat(glue.getResourcePolicy(GetResourcePolicyRequest.builder().build()).policyInJson()).isEqualTo(policyV2);
+        assertThat(glue.getResourcePolicies(GetResourcePoliciesRequest.builder().build()).getResourcePoliciesResponseList()).hasSize(1);
+
+        assertThatThrownBy(() -> glue.deleteResourcePolicy(DeleteResourcePolicyRequest.builder()
+                .policyHashCondition(hash).build()))
+                .isInstanceOf(ConditionCheckFailureException.class);
+        glue.deleteResourcePolicy(DeleteResourcePolicyRequest.builder().policyHashCondition(hash2).build());
+        assertThatThrownBy(() -> glue.getResourcePolicy(GetResourcePolicyRequest.builder().build()))
+                .isInstanceOf(EntityNotFoundException.class);
+
+        var settings = glue.getDataCatalogEncryptionSettings(GetDataCatalogEncryptionSettingsRequest.builder().build())
+                .dataCatalogEncryptionSettings();
+        assertThat(settings.encryptionAtRest().catalogEncryptionModeAsString()).isEqualTo("DISABLED");
+        assertThat(settings.connectionPasswordEncryption().returnConnectionPasswordEncrypted()).isFalse();
     }
 
     private static TableInput tableInput(String description) {

@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.glue.schemaregistry.GlueSchemaRegistryService;
+import io.github.hectorvent.floci.services.kms.KmsService;
 import io.github.hectorvent.floci.services.resourcegroupstagging.ResourceGroupsTaggingService;
 import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.BeforeEach;
@@ -41,7 +42,8 @@ class GlueJsonHandlerEmptyListTest {
         GlueSchemaRegistryService schemaRegistryService =
                 new GlueSchemaRegistryService(storageFactory, regionResolver);
         GlueService glueService = new GlueService(
-                storageFactory, schemaRegistryService, regionResolver, new ResourceGroupsTaggingService(storageFactory));
+                storageFactory, schemaRegistryService, regionResolver, new ResourceGroupsTaggingService(storageFactory),
+                new KmsService(storageFactory, regionResolver));
         handler = new GlueJsonHandler(glueService, schemaRegistryService, mapper);
     }
 

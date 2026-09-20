@@ -12,6 +12,10 @@ import io.github.hectorvent.floci.services.glue.model.Column;
 import io.github.hectorvent.floci.services.glue.model.Database;
 import io.github.hectorvent.floci.services.glue.model.Connection;
 import io.github.hectorvent.floci.services.glue.model.ConnectionInput;
+import io.github.hectorvent.floci.services.glue.model.ConnectionPasswordEncryption;
+import io.github.hectorvent.floci.services.glue.model.DataCatalogEncryptionSettings;
+import io.github.hectorvent.floci.services.glue.model.EncryptionAtRest;
+import io.github.hectorvent.floci.services.glue.model.GluePolicy;
 import io.github.hectorvent.floci.services.glue.model.Crawler;
 import io.github.hectorvent.floci.services.glue.model.AuthenticationConfiguration;
 import io.github.hectorvent.floci.services.glue.model.PhysicalConnectionRequirements;
@@ -28,6 +32,7 @@ import io.github.hectorvent.floci.services.glue.model.StorageDescriptor;
 import io.github.hectorvent.floci.services.glue.model.Table;
 import io.github.hectorvent.floci.services.glue.model.UserDefinedFunction;
 import io.github.hectorvent.floci.services.glue.schemaregistry.GlueSchemaRegistryService;
+import io.github.hectorvent.floci.services.kms.KmsService;
 import io.github.hectorvent.floci.services.glue.schemaregistry.model.RegistryId;
 import io.github.hectorvent.floci.services.glue.schemaregistry.model.SchemaId;
 import io.github.hectorvent.floci.services.resourcegroupstagging.ResourceGroupsTaggingService;
@@ -35,6 +40,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -44,6 +51,7 @@ import java.util.concurrent.CountDownLatch;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -65,6 +73,7 @@ class GlueServiceTest {
 
     private GlueService glueService;
     private GlueSchemaRegistryService schemaRegistryService;
+    private KmsService kmsService;
     private StorageBackend<String, Database> databaseStore;
     private StorageBackend<String, Table> tableStore;
     private StorageBackend<String, Table> tableVersionStore;
@@ -76,6 +85,7 @@ class GlueServiceTest {
         RegionResolver regionResolver = new RegionResolver(REGION, ACCOUNT_ID);
         StorageFactory storageFactory = new InMemoryStorageFactory();
         schemaRegistryService = new GlueSchemaRegistryService(storageFactory, regionResolver);
+        kmsService = new KmsService(storageFactory, regionResolver);
         databaseStore = new InMemoryStorage<>();
         tableStore = new InMemoryStorage<>();
         tableVersionStore = new InMemoryStorage<>();
@@ -94,7 +104,10 @@ class GlueServiceTest {
                 new InMemoryStorage<String, Crawler>(),
                 new InMemoryStorage<String, Classifier>(),
                 new InMemoryStorage<String, Connection>(),
-                schemaRegistryService, regionResolver, new ResourceGroupsTaggingService(null));
+                new InMemoryStorage<String, GluePolicy>(),
+                new InMemoryStorage<String, DataCatalogEncryptionSettings>(),
+                schemaRegistryService, regionResolver, new ResourceGroupsTaggingService(null),
+                kmsService);
         glueService.createDatabase(new Database("db1"));
     }
 
@@ -1528,7 +1541,7 @@ class GlueServiceTest {
         redefinition.setName("orders");
         redefinition.setConnectionType("JDBC");
         redefinition.setConnectionProperties(Map.of("JDBC_CONNECTION_URL", "jdbc:postgresql://db2.internal:5432/orders"));
-        glueService.updateConnection("orders", redefinition);
+        glueService.updateConnection("orders", redefinition, REGION);
 
         Connection updated = glueService.getConnection("orders", false);
         assertEquals("jdbc:postgresql://db2.internal:5432/orders", updated.getConnectionProperties().get("JDBC_CONNECTION_URL"));
@@ -1553,7 +1566,7 @@ class GlueServiceTest {
         assertEquals("AlreadyExistsException", duplicate.getErrorCode());
 
         AwsException missing = assertThrows(AwsException.class,
-                () -> glueService.updateConnection("absent", jdbcConnection("absent")));
+                () -> glueService.updateConnection("absent", jdbcConnection("absent"), REGION));
         assertEquals("EntityNotFoundException", missing.getErrorCode());
 
         AwsException missingDelete = assertThrows(AwsException.class,
@@ -1718,6 +1731,176 @@ class GlueServiceTest {
         glueService.deleteConnection("tagged", REGION);
         assertEquals("EntityNotFoundException",
                 assertThrows(AwsException.class, () -> glueService.getTags(arn, REGION)).getErrorCode());
+    }
+
+    // ---- Catalog resource policy and encryption settings -----------------------------------
+
+    private static final String POLICY_V1 = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::111122223333:root\"},\"Action\":\"glue:GetTable\",\"Resource\":\"*\"}]}";
+    private static final String POLICY_V2 = POLICY_V1.replace("glue:GetTable", "glue:GetTables");
+
+    @Test
+    void resourcePolicyFollowsTheTerraformSequenceOfConditions() {
+        assertEquals("EntityNotFoundException",
+                assertThrows(AwsException.class, () -> glueService.getResourcePolicy()).getErrorCode());
+        assertTrue(glueService.getResourcePolicies(null, null).items().isEmpty());
+
+        // Create: NOT_EXIST must pass on an empty catalog.
+        String hash = glueService.putResourcePolicy(POLICY_V1, null, "NOT_EXIST", null);
+        GluePolicy stored = glueService.getResourcePolicy();
+        assertEquals(POLICY_V1, stored.getPolicyInJson());
+        assertEquals(hash, stored.getPolicyHash());
+        assertNotNull(stored.getCreateTime());
+        assertEquals(stored.getCreateTime(), stored.getUpdateTime());
+        assertEquals(1, glueService.getResourcePolicies(null, null).items().size());
+
+        // A second create must fail, an update must pass and keep CreateTime.
+        assertEquals("ConditionCheckFailureException",
+                assertThrows(AwsException.class,
+                        () -> glueService.putResourcePolicy(POLICY_V2, null, "NOT_EXIST", null)).getErrorCode());
+        String hash2 = glueService.putResourcePolicy(POLICY_V2, hash, "MUST_EXIST", "TRUE");
+        GluePolicy updated = glueService.getResourcePolicy();
+        assertEquals(POLICY_V2, updated.getPolicyInJson());
+        assertNotEquals(hash, hash2);
+        assertEquals(stored.getCreateTime(), updated.getCreateTime());
+        assertFalse(updated.getUpdateTime().isBefore(stored.getUpdateTime()));
+
+        // A stale hash is refused on put and on delete; the right one is accepted.
+        assertEquals("ConditionCheckFailureException",
+                assertThrows(AwsException.class,
+                        () -> glueService.putResourcePolicy(POLICY_V1, hash, "NONE", null)).getErrorCode());
+        assertEquals("ConditionCheckFailureException",
+                assertThrows(AwsException.class, () -> glueService.deleteResourcePolicy(hash)).getErrorCode());
+        glueService.deleteResourcePolicy(hash2);
+        assertEquals("EntityNotFoundException",
+                assertThrows(AwsException.class, () -> glueService.deleteResourcePolicy(null)).getErrorCode());
+        assertEquals("ConditionCheckFailureException",
+                assertThrows(AwsException.class,
+                        () -> glueService.putResourcePolicy(POLICY_V1, null, "MUST_EXIST", null)).getErrorCode());
+    }
+
+    @Test
+    void resourcePolicyInputIsValidated() {
+        assertEquals("InvalidInputException",
+                assertThrows(AwsException.class, () -> glueService.putResourcePolicy(null, null, null, null)).getErrorCode());
+        assertEquals("InvalidInputException",
+                assertThrows(AwsException.class, () -> glueService.putResourcePolicy("{", null, null, null)).getErrorCode());
+        assertEquals("InvalidInputException",
+                assertThrows(AwsException.class, () -> glueService.putResourcePolicy("[]", null, null, null)).getErrorCode());
+        assertEquals("InvalidInputException",
+                assertThrows(AwsException.class, () -> glueService.putResourcePolicy(POLICY_V1, null, "MAYBE", null)).getErrorCode());
+        assertEquals("InvalidInputException",
+                assertThrows(AwsException.class, () -> glueService.putResourcePolicy(POLICY_V1, null, null, "yes")).getErrorCode());
+        // The same document always hashes the same, so a client can compare hashes across reads.
+        assertEquals(glueService.putResourcePolicy(POLICY_V1, null, null, null),
+                glueService.putResourcePolicy(POLICY_V1, null, null, null));
+    }
+
+    @Test
+    void encryptionSettingsDefaultToOffAndAreReplacedByPut() {
+        DataCatalogEncryptionSettings defaults = glueService.getDataCatalogEncryptionSettings();
+        assertEquals("DISABLED", defaults.getEncryptionAtRest().getCatalogEncryptionMode());
+        assertEquals(false, defaults.getConnectionPasswordEncryption().getReturnConnectionPasswordEncrypted());
+        assertNull(defaults.getConnectionPasswordEncryption().getAwsKmsKeyId());
+
+        DataCatalogEncryptionSettings put = new DataCatalogEncryptionSettings();
+        EncryptionAtRest atRest = new EncryptionAtRest();
+        atRest.setCatalogEncryptionMode("SSE-KMS");
+        atRest.setSseAwsKmsKeyId("alias/catalog");
+        put.setEncryptionAtRest(atRest);
+        glueService.putDataCatalogEncryptionSettings(put);
+
+        DataCatalogEncryptionSettings read = glueService.getDataCatalogEncryptionSettings();
+        assertEquals("SSE-KMS", read.getEncryptionAtRest().getCatalogEncryptionMode());
+        assertEquals("alias/catalog", read.getEncryptionAtRest().getSseAwsKmsKeyId());
+        // The block left out of the put is reported with its default, not dropped.
+        assertEquals(false, read.getConnectionPasswordEncryption().getReturnConnectionPasswordEncrypted());
+
+        EncryptionAtRest badMode = new EncryptionAtRest();
+        badMode.setCatalogEncryptionMode("AES");
+        DataCatalogEncryptionSettings invalid = new DataCatalogEncryptionSettings();
+        invalid.setEncryptionAtRest(badMode);
+        assertEquals("InvalidInputException",
+                assertThrows(AwsException.class, () -> glueService.putDataCatalogEncryptionSettings(invalid)).getErrorCode());
+        DataCatalogEncryptionSettings missingFlag = new DataCatalogEncryptionSettings();
+        missingFlag.setConnectionPasswordEncryption(new ConnectionPasswordEncryption());
+        assertEquals("InvalidInputException",
+                assertThrows(AwsException.class, () -> glueService.putDataCatalogEncryptionSettings(missingFlag)).getErrorCode());
+        assertEquals("InvalidInputException",
+                assertThrows(AwsException.class, () -> glueService.putDataCatalogEncryptionSettings(null)).getErrorCode());
+    }
+
+    private void enableConnectionPasswordEncryption(String keyId) {
+        ConnectionPasswordEncryption passwords = new ConnectionPasswordEncryption();
+        passwords.setReturnConnectionPasswordEncrypted(true);
+        passwords.setAwsKmsKeyId(keyId);
+        DataCatalogEncryptionSettings settings = new DataCatalogEncryptionSettings();
+        settings.setConnectionPasswordEncryption(passwords);
+        glueService.putDataCatalogEncryptionSettings(settings);
+    }
+
+    @Test
+    void connectionPasswordsAreStoredEncryptedOnceTheCatalogSettingIsOn() {
+        String keyId = kmsService.createKey("glue connection passwords", REGION).getKeyId();
+        enableConnectionPasswordEncryption(keyId);
+
+        ConnectionInput jdbc = jdbcConnection("enc-jdbc");
+        glueService.createConnection(jdbc, null, REGION);
+        Connection stored = glueService.getConnection("enc-jdbc", false);
+        assertNull(stored.getConnectionProperties().get("PASSWORD"));
+        String encrypted = stored.getConnectionProperties().get("ENCRYPTED_PASSWORD");
+        assertNotNull(encrypted);
+        assertEquals("s3cret", new String(
+                kmsService.decrypt(Base64.getDecoder().decode(encrypted), REGION), StandardCharsets.UTF_8));
+        assertEquals("app", stored.getConnectionProperties().get("USERNAME"));
+        // HidePassword removes the encrypted form as it removes the plaintext one.
+        assertNull(glueService.getConnection("enc-jdbc", true).getConnectionProperties().get("ENCRYPTED_PASSWORD"));
+
+        ConnectionInput kafka = jdbcConnection("enc-kafka");
+        kafka.setConnectionType("KAFKA");
+        Map<String, String> properties = new LinkedHashMap<>();
+        properties.put("KAFKA_BOOTSTRAP_SERVERS", "broker:9092");
+        properties.put("KAFKA_SASL_MECHANISM", "SCRAM-SHA-512");
+        properties.put("KAFKA_SASL_SCRAM_USERNAME", "svc");
+        properties.put("KAFKA_SASL_SCRAM_PASSWORD", "scram-pw");
+        properties.put("KAFKA_CLIENT_KEYSTORE_PASSWORD", "ks-pw");
+        kafka.setConnectionProperties(properties);
+        glueService.createConnection(kafka, null, REGION);
+        Map<String, String> kafkaStored = glueService.getConnection("enc-kafka", false).getConnectionProperties();
+        assertNull(kafkaStored.get("KAFKA_SASL_SCRAM_PASSWORD"));
+        assertNull(kafkaStored.get("KAFKA_CLIENT_KEYSTORE_PASSWORD"));
+        assertNotNull(kafkaStored.get("ENCRYPTED_KAFKA_SASL_SCRAM_PASSWORD"));
+        assertNotNull(kafkaStored.get("ENCRYPTED_KAFKA_CLIENT_KEYSTORE_PASSWORD"));
+        assertEquals("svc", kafkaStored.get("KAFKA_SASL_SCRAM_USERNAME"));
+
+        // An update goes through the same path.
+        ConnectionInput redefinition = jdbcConnection("enc-jdbc");
+        redefinition.setConnectionProperties(Map.of("JDBC_CONNECTION_URL", "jdbc:x://h/d", "PASSWORD", "changed"));
+        glueService.updateConnection("enc-jdbc", redefinition, REGION);
+        Map<String, String> afterUpdate = glueService.getConnection("enc-jdbc", false).getConnectionProperties();
+        assertNull(afterUpdate.get("PASSWORD"));
+        assertEquals("changed", new String(kmsService.decrypt(
+                Base64.getDecoder().decode(afterUpdate.get("ENCRYPTED_PASSWORD")), REGION), StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void connectionPasswordEncryptionFailuresAreGlueEncryptionExceptions() {
+        enableConnectionPasswordEncryption("arn:aws:kms:us-east-1:000000000000:key/00000000-0000-0000-0000-000000000000");
+        AwsException unknownKey = assertThrows(AwsException.class,
+                () -> glueService.createConnection(jdbcConnection("enc-bad-key"), null, REGION));
+        assertEquals("GlueEncryptionException", unknownKey.getErrorCode());
+        assertEquals("EntityNotFoundException",
+                assertThrows(AwsException.class, () -> glueService.getConnection("enc-bad-key", false)).getErrorCode());
+
+        enableConnectionPasswordEncryption(null);
+        assertEquals("GlueEncryptionException",
+                assertThrows(AwsException.class,
+                        () -> glueService.createConnection(jdbcConnection("enc-no-key"), null, REGION)).getErrorCode());
+
+        // A connection without any password property is unaffected by the setting.
+        ConnectionInput network = jdbcConnection("enc-network");
+        network.setConnectionType("NETWORK");
+        network.setConnectionProperties(Map.of());
+        assertEquals("READY", glueService.createConnection(network, null, REGION));
     }
 
     private static List<String> names(GlueService.Page<Table> page) {

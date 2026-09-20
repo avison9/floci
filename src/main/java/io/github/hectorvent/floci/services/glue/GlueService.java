@@ -1,7 +1,10 @@
 package io.github.hectorvent.floci.services.glue;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
@@ -10,6 +13,10 @@ import io.github.hectorvent.floci.services.glue.model.Classifier;
 import io.github.hectorvent.floci.services.glue.model.Column;
 import io.github.hectorvent.floci.services.glue.model.Connection;
 import io.github.hectorvent.floci.services.glue.model.ConnectionInput;
+import io.github.hectorvent.floci.services.glue.model.ConnectionPasswordEncryption;
+import io.github.hectorvent.floci.services.glue.model.DataCatalogEncryptionSettings;
+import io.github.hectorvent.floci.services.glue.model.EncryptionAtRest;
+import io.github.hectorvent.floci.services.glue.model.GluePolicy;
 import io.github.hectorvent.floci.services.glue.model.Crawler;
 import io.github.hectorvent.floci.services.glue.model.CrawlerTargets;
 import io.github.hectorvent.floci.services.glue.model.Database;
@@ -27,6 +34,7 @@ import io.github.hectorvent.floci.services.glue.schemaregistry.GlueSchemaRegistr
 import io.github.hectorvent.floci.services.glue.schemaregistry.SchemaToColumnsConverter;
 import io.github.hectorvent.floci.services.glue.schemaregistry.model.SchemaId;
 import io.github.hectorvent.floci.services.glue.schemaregistry.model.SchemaVersion;
+import io.github.hectorvent.floci.services.kms.KmsService;
 import io.github.hectorvent.floci.services.resourcegroupstagging.ResourceGroupsTaggingService;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -35,6 +43,8 @@ import org.jboss.logging.Logger;
 
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -113,6 +123,23 @@ public class GlueService {
             "ENDPOINT_TYPE", "ROLE_ARN", "REGION", "WORKGROUP_NAME", "CLUSTER_IDENTIFIER", "DATABASE");
     private static final String CONNECTION_STATUS_READY = "READY";
 
+    // The catalog holds one resource policy and one security configuration; both stores are
+    // account-scoped by StorageFactory, so a fixed key is the whole address.
+    private static final String CATALOG_KEY = "catalog";
+    private static final ObjectMapper POLICY_JSON = new ObjectMapper();
+    private static final Set<String> POLICY_EXISTS_CONDITIONS = Set.of("MUST_EXIST", "NOT_EXIST", "NONE");
+    private static final Set<String> ENABLE_HYBRID_VALUES = Set.of("TRUE", "FALSE");
+    private static final Set<String> CATALOG_ENCRYPTION_MODES = Set.of(
+            "DISABLED", "SSE-KMS", "SSE-KMS-WITH-SERVICE-ROLE");
+    // The Connection structure names the stored form of each password when the catalog's
+    // ConnectionPasswordEncryption is on: the plaintext key is replaced by its ENCRYPTED_ twin.
+    private static final Map<String, String> ENCRYPTED_CONNECTION_PROPERTY_KEYS = Map.of(
+            "PASSWORD", "ENCRYPTED_PASSWORD",
+            "KAFKA_CLIENT_KEYSTORE_PASSWORD", "ENCRYPTED_KAFKA_CLIENT_KEYSTORE_PASSWORD",
+            "KAFKA_CLIENT_KEY_PASSWORD", "ENCRYPTED_KAFKA_CLIENT_KEY_PASSWORD",
+            "KAFKA_SASL_PLAIN_PASSWORD", "ENCRYPTED_KAFKA_SASL_PLAIN_PASSWORD",
+            "KAFKA_SASL_SCRAM_PASSWORD", "ENCRYPTED_KAFKA_SASL_SCRAM_PASSWORD");
+
     // Glue's partition index states. FAILED also exists but is only reachable through a backfill
     // failure, which is not emulated.
     private static final String INDEX_STATUS_CREATING = "CREATING";
@@ -131,15 +158,19 @@ public class GlueService {
     private final StorageBackend<String, Crawler> crawlerStore;
     private final StorageBackend<String, Classifier> classifierStore;
     private final StorageBackend<String, Connection> connectionStore;
+    private final StorageBackend<String, GluePolicy> resourcePolicyStore;
+    private final StorageBackend<String, DataCatalogEncryptionSettings> encryptionSettingsStore;
     private final GlueSchemaRegistryService schemaRegistryService;
     private final RegionResolver regionResolver;
     private final ResourceGroupsTaggingService resourceGroupsTaggingService;
+    private final KmsService kmsService;
 
     @Inject
     public GlueService(StorageFactory storageFactory,
                        GlueSchemaRegistryService schemaRegistryService,
                        RegionResolver regionResolver,
-                       ResourceGroupsTaggingService resourceGroupsTaggingService) {
+                       ResourceGroupsTaggingService resourceGroupsTaggingService,
+                       KmsService kmsService) {
         this.databaseStore = storageFactory.create("glue", "databases.json", new TypeReference<>() {});
         this.tableStore = storageFactory.create("glue", "tables.json", new TypeReference<>() {});
         this.tableVersionStore = storageFactory.create("glue", "table_versions.json", new TypeReference<>() {});
@@ -154,9 +185,13 @@ public class GlueService {
         this.crawlerStore = storageFactory.create("glue", "crawlers.json", new TypeReference<>() {});
         this.classifierStore = storageFactory.create("glue", "classifiers.json", new TypeReference<>() {});
         this.connectionStore = storageFactory.create("glue", "connections.json", new TypeReference<>() {});
+        this.resourcePolicyStore = storageFactory.create("glue", "resource_policy.json", new TypeReference<>() {});
+        this.encryptionSettingsStore = storageFactory.create(
+                "glue", "catalog_encryption_settings.json", new TypeReference<>() {});
         this.schemaRegistryService = schemaRegistryService;
         this.regionResolver = regionResolver;
         this.resourceGroupsTaggingService = resourceGroupsTaggingService;
+        this.kmsService = kmsService;
     }
 
     GlueService(StorageBackend<String, Database> databaseStore,
@@ -171,9 +206,12 @@ public class GlueService {
                 StorageBackend<String, Crawler> crawlerStore,
                 StorageBackend<String, Classifier> classifierStore,
                 StorageBackend<String, Connection> connectionStore,
+                StorageBackend<String, GluePolicy> resourcePolicyStore,
+                StorageBackend<String, DataCatalogEncryptionSettings> encryptionSettingsStore,
                 GlueSchemaRegistryService schemaRegistryService,
                 RegionResolver regionResolver,
-                ResourceGroupsTaggingService resourceGroupsTaggingService) {
+                ResourceGroupsTaggingService resourceGroupsTaggingService,
+                KmsService kmsService) {
         this.databaseStore = databaseStore;
         this.tableStore = tableStore;
         this.tableVersionStore = tableVersionStore;
@@ -186,9 +224,12 @@ public class GlueService {
         this.crawlerStore = crawlerStore;
         this.classifierStore = classifierStore;
         this.connectionStore = connectionStore;
+        this.resourcePolicyStore = resourcePolicyStore;
+        this.encryptionSettingsStore = encryptionSettingsStore;
         this.schemaRegistryService = schemaRegistryService;
         this.regionResolver = regionResolver;
         this.resourceGroupsTaggingService = resourceGroupsTaggingService;
+        this.kmsService = kmsService;
     }
 
     public void createDatabase(Database database) {
@@ -1951,6 +1992,7 @@ public class GlueService {
         }
         Instant now = Instant.now();
         Connection connection = toConnection(input);
+        encryptConnectionPasswords(connection.getConnectionProperties(), region);
         connection.setCreationTime(now);
         connection.setLastUpdatedTime(now);
         connectionStore.put(name, connection);
@@ -2002,13 +2044,14 @@ public class GlueService {
      * (API reference), so the stored definition is replaced rather than merged: a member left
      * out of the input is gone afterwards. The connection keeps its name and creation time.
      */
-    public void updateConnection(String name, ConnectionInput input) {
+    public void updateConnection(String name, ConnectionInput input, String region) {
         validateRequired(name, "Name");
         validateRequired(input, "ConnectionInput");
         Connection existing = connectionStore.get(name)
                 .orElseThrow(() -> new AwsException("EntityNotFoundException", "Connection " + name + " not found.", 400));
         validateConnectionInput(input);
         Connection updated = toConnection(input);
+        encryptConnectionPasswords(updated.getConnectionProperties(), region);
         updated.setName(existing.getName());
         updated.setCreationTime(existing.getCreationTime());
         updated.setLastUpdatedTime(Instant.now());
@@ -2135,6 +2178,173 @@ public class GlueService {
     public record BatchDeleteConnectionResult(
             @JsonProperty("Succeeded") List<String> succeeded,
             @JsonProperty("Errors") Map<String, ErrorDetail> errors) {}
+
+    // ---- Catalog resource policy and encryption settings -----------------------------------
+
+    /**
+     * Sets the catalog's one resource policy. {@code PolicyExistsCondition} and
+     * {@code PolicyHashCondition} are checked against the stored policy first and fail with
+     * ConditionCheckFailureException, which is how Terraform's create (NOT_EXIST) and update
+     * (MUST_EXIST) tell each other apart. Returns the new policy's hash.
+     */
+    public String putResourcePolicy(String policyInJson, String policyHashCondition,
+                                    String policyExistsCondition, String enableHybrid) {
+        validateRequired(policyInJson, "PolicyInJson");
+        validatePolicyDocument(policyInJson);
+        if (policyExistsCondition != null && !POLICY_EXISTS_CONDITIONS.contains(policyExistsCondition)) {
+            throw new AwsException("InvalidInputException",
+                    "Unsupported PolicyExistsCondition: " + policyExistsCondition, 400);
+        }
+        if (enableHybrid != null && !ENABLE_HYBRID_VALUES.contains(enableHybrid)) {
+            throw new AwsException("InvalidInputException", "Unsupported EnableHybrid value: " + enableHybrid, 400);
+        }
+        Optional<GluePolicy> existing = resourcePolicyStore.get(CATALOG_KEY);
+        if ("NOT_EXIST".equals(policyExistsCondition) && existing.isPresent()) {
+            throw new AwsException("ConditionCheckFailureException",
+                    "A resource policy already exists and PolicyExistsCondition is NOT_EXIST.", 400);
+        }
+        if ("MUST_EXIST".equals(policyExistsCondition) && existing.isEmpty()) {
+            throw new AwsException("ConditionCheckFailureException",
+                    "No resource policy exists and PolicyExistsCondition is MUST_EXIST.", 400);
+        }
+        checkPolicyHashCondition(policyHashCondition, existing);
+
+        Instant now = Instant.now();
+        GluePolicy policy = new GluePolicy();
+        policy.setPolicyInJson(policyInJson);
+        policy.setPolicyHash(policyHash(policyInJson));
+        policy.setCreateTime(existing.map(GluePolicy::getCreateTime).orElse(now));
+        policy.setUpdateTime(now);
+        resourcePolicyStore.put(CATALOG_KEY, policy);
+        LOG.infov("Set Glue catalog resource policy (hash {0})", policy.getPolicyHash());
+        return policy.getPolicyHash();
+    }
+
+    public GluePolicy getResourcePolicy() {
+        return resourcePolicyStore.get(CATALOG_KEY)
+                .orElseThrow(() -> new AwsException("EntityNotFoundException", "Policy not found", 400));
+    }
+
+    /** The catalog policy is the only entry; RAM-granted per-resource policies are not emulated. */
+    public Page<GluePolicy> getResourcePolicies(Integer maxResults, String nextToken) {
+        List<GluePolicy> policies = new ArrayList<>(resourcePolicyStore.get(CATALOG_KEY).stream().toList());
+        return paginate(policies, maxResults, nextToken);
+    }
+
+    public void deleteResourcePolicy(String policyHashCondition) {
+        Optional<GluePolicy> existing = resourcePolicyStore.get(CATALOG_KEY);
+        if (existing.isEmpty()) {
+            throw new AwsException("EntityNotFoundException", "Policy not found", 400);
+        }
+        checkPolicyHashCondition(policyHashCondition, existing);
+        resourcePolicyStore.delete(CATALOG_KEY);
+        LOG.info("Deleted Glue catalog resource policy");
+    }
+
+    /** Before anything is put, a catalog reports both blocks with encryption off. */
+    public DataCatalogEncryptionSettings getDataCatalogEncryptionSettings() {
+        return encryptionSettingsStore.get(CATALOG_KEY).orElseGet(DataCatalogEncryptionSettings::defaults);
+    }
+
+    /**
+     * Replaces the catalog's security configuration. A block left out of the request keeps the
+     * default (off), so a later read always carries both blocks, as AWS's does.
+     */
+    public void putDataCatalogEncryptionSettings(DataCatalogEncryptionSettings settings) {
+        validateRequired(settings, "DataCatalogEncryptionSettings");
+        DataCatalogEncryptionSettings stored = DataCatalogEncryptionSettings.defaults();
+        EncryptionAtRest atRest = settings.getEncryptionAtRest();
+        if (atRest != null) {
+            validateRequired(atRest.getCatalogEncryptionMode(), "EncryptionAtRest.CatalogEncryptionMode");
+            if (!CATALOG_ENCRYPTION_MODES.contains(atRest.getCatalogEncryptionMode())) {
+                throw new AwsException("InvalidInputException",
+                        "Unsupported CatalogEncryptionMode: " + atRest.getCatalogEncryptionMode(), 400);
+            }
+            stored.setEncryptionAtRest(atRest);
+        }
+        ConnectionPasswordEncryption passwords = settings.getConnectionPasswordEncryption();
+        if (passwords != null) {
+            validateRequired(passwords.getReturnConnectionPasswordEncrypted(),
+                    "ConnectionPasswordEncryption.ReturnConnectionPasswordEncrypted");
+            stored.setConnectionPasswordEncryption(passwords);
+        }
+        encryptionSettingsStore.put(CATALOG_KEY, stored);
+        LOG.infov("Updated Glue Data Catalog encryption settings: at rest {0}, password encryption {1}",
+                stored.getEncryptionAtRest().getCatalogEncryptionMode(),
+                stored.getConnectionPasswordEncryption().getReturnConnectionPasswordEncrypted());
+    }
+
+    /**
+     * Applies the catalog's ConnectionPasswordEncryption to a connection being created or
+     * updated: each plaintext password property is encrypted with the configured KMS key and
+     * stored under its ENCRYPTED_ name (the Connection structure documents each pair), so every
+     * later read returns it encrypted. A KMS failure is the GlueEncryptionException both
+     * operations list.
+     */
+    private void encryptConnectionPasswords(Map<String, String> properties, String region) {
+        ConnectionPasswordEncryption setting = getDataCatalogEncryptionSettings().getConnectionPasswordEncryption();
+        if (setting == null || !Boolean.TRUE.equals(setting.getReturnConnectionPasswordEncrypted())) {
+            return;
+        }
+        String keyId = setting.getAwsKmsKeyId();
+        for (Map.Entry<String, String> pair : ENCRYPTED_CONNECTION_PROPERTY_KEYS.entrySet()) {
+            String plaintext = properties.get(pair.getKey());
+            if (plaintext == null) {
+                continue;
+            }
+            if (keyId == null || keyId.isBlank()) {
+                throw new AwsException("GlueEncryptionException",
+                        "Connection password encryption is enabled but the catalog settings name no AwsKmsKeyId.", 400);
+            }
+            byte[] ciphertext;
+            try {
+                ciphertext = kmsService.encrypt(keyId, plaintext.getBytes(StandardCharsets.UTF_8), region);
+            } catch (AwsException e) {
+                throw new AwsException("GlueEncryptionException",
+                        "An encryption operation failed: " + e.getMessage(), 400);
+            }
+            properties.remove(pair.getKey());
+            properties.put(pair.getValue(), Base64.getEncoder().encodeToString(ciphertext));
+        }
+    }
+
+    private static void validatePolicyDocument(String policyInJson) {
+        if (policyInJson.length() < 2) {
+            throw new AwsException("InvalidInputException", "PolicyInJson must be at least 2 characters.", 400);
+        }
+        try {
+            JsonNode document = POLICY_JSON.readTree(policyInJson);
+            if (document == null || !document.isObject()) {
+                throw new AwsException("InvalidInputException", "PolicyInJson must be a JSON policy document.", 400);
+            }
+        } catch (JsonProcessingException e) {
+            throw new AwsException("InvalidInputException", "PolicyInJson is not valid JSON: " + e.getOriginalMessage(), 400);
+        }
+    }
+
+    private static void checkPolicyHashCondition(String policyHashCondition, Optional<GluePolicy> existing) {
+        if (policyHashCondition == null || policyHashCondition.isBlank()) {
+            return;
+        }
+        String current = existing.map(GluePolicy::getPolicyHash).orElse(null);
+        if (!policyHashCondition.equals(current)) {
+            throw new AwsException("ConditionCheckFailureException",
+                    "PolicyHashCondition does not match the current policy hash.", 400);
+        }
+    }
+
+    /**
+     * AWS documents PolicyHash only as an opaque value to echo back in PolicyHashCondition; this
+     * derives it from the document so the same policy always yields the same hash.
+     */
+    private static String policyHash(String policyInJson) {
+        try {
+            byte[] digest = MessageDigest.getInstance("MD5").digest(policyInJson.getBytes(StandardCharsets.UTF_8));
+            return Base64.getEncoder().encodeToString(digest);
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("MD5 is a required JDK algorithm", e);
+        }
+    }
 
     public void tagResource(String arn, Map<String, String> tags, String region) {
         validateArn(arn);

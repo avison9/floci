@@ -289,7 +289,7 @@ public class GlueJsonHandler {
             case "CreateConnection" -> handleCreateConnection(request, region);
             case "GetConnection" -> handleGetConnection(request);
             case "GetConnections" -> handleGetConnections(request);
-            case "UpdateConnection" -> handleUpdateConnection(request);
+            case "UpdateConnection" -> handleUpdateConnection(request, region);
             case "DeleteConnection" -> {
                 glueService.deleteConnection(request.path("ConnectionName").asText(null), region);
                 yield Response.ok(Map.of()).build();
@@ -301,6 +301,33 @@ public class GlueJsonHandler {
                 yield Response.ok(glueService.batchDeleteConnections(names, region)).build();
             }
             case "TestConnection" -> handleTestConnection(request);
+            case "PutResourcePolicy" -> {
+                String hash = glueService.putResourcePolicy(
+                        request.path("PolicyInJson").asText(null),
+                        request.path("PolicyHashCondition").asText(null),
+                        request.path("PolicyExistsCondition").asText(null),
+                        request.path("EnableHybrid").asText(null));
+                yield Response.ok(Map.of("PolicyHash", hash)).build();
+            }
+            case "GetResourcePolicy" -> Response.ok(glueService.getResourcePolicy()).build();
+            case "GetResourcePolicies" -> {
+                GlueService.Page<GluePolicy> page =
+                        glueService.getResourcePolicies(readMaxResults(request), readNextToken(request));
+                yield Response.ok(pageResponse("GetResourcePoliciesResponseList", page.items(), page.nextToken())).build();
+            }
+            case "DeleteResourcePolicy" -> {
+                glueService.deleteResourcePolicy(request.path("PolicyHashCondition").asText(null));
+                yield Response.ok(Map.of()).build();
+            }
+            case "GetDataCatalogEncryptionSettings" -> Response.ok(Map.of(
+                    "DataCatalogEncryptionSettings", glueService.getDataCatalogEncryptionSettings())).build();
+            case "PutDataCatalogEncryptionSettings" -> {
+                DataCatalogEncryptionSettings settings = request.hasNonNull("DataCatalogEncryptionSettings")
+                        ? mapper.treeToValue(request.get("DataCatalogEncryptionSettings"), DataCatalogEncryptionSettings.class)
+                        : null;
+                glueService.putDataCatalogEncryptionSettings(settings);
+                yield Response.ok(Map.of()).build();
+            }
             // Read-only Glue actions for resources the emulator does not model. The AWS SDK
             // expects each to return a 200 with its result key present (empty), so we emit the
             // documented empty shape rather than an InvalidAction 400 that callers can't read.
@@ -907,11 +934,11 @@ public class GlueJsonHandler {
         return Response.ok(pageResponse("ConnectionList", page.items(), page.nextToken())).build();
     }
 
-    private Response handleUpdateConnection(JsonNode request) throws Exception {
+    private Response handleUpdateConnection(JsonNode request, String region) throws Exception {
         ConnectionInput input = request.hasNonNull("ConnectionInput")
                 ? mapper.treeToValue(request.get("ConnectionInput"), ConnectionInput.class)
                 : null;
-        glueService.updateConnection(request.path("Name").asText(null), input);
+        glueService.updateConnection(request.path("Name").asText(null), input, region);
         return Response.ok(Map.of()).build();
     }
 

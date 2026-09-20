@@ -86,10 +86,41 @@ under `AuthenticationConfiguration` are accepted and never returned by a read. A
 `HidePassword` removes `PASSWORD` and `ENCRYPTED_PASSWORD`, the two members the API reference defines as the
 connection's password. The Kafka credentials (`KAFKA_CLIENT_KEYSTORE_PASSWORD`, `KAFKA_CLIENT_KEY_PASSWORD`,
 `KAFKA_SASL_PLAIN_PASSWORD`, `KAFKA_SASL_SCRAM_PASSWORD` and their `ENCRYPTED_` forms) are returned as stored: the
-reference does not say whether the flag covers them, so Floci does not guess.
+reference does not say whether the flag covers them, so Floci does not guess. The `ENCRYPTED_` forms are what the
+catalog's `ConnectionPasswordEncryption` setting produces (see Encryption settings below).
 
 `TestConnection` is asynchronous on AWS and returns nothing; Floci checks the request's shape and accepts it
 without opening a socket to the data store, since no job or crawler runs against a connection yet.
+
+#### Resource policy
+
+| Action | Description |
+|--------|-------------|
+| PutResourcePolicy | Sets the catalog's resource policy from `PolicyInJson` and returns its `PolicyHash`. `PolicyExistsCondition` (`NOT_EXIST`, `MUST_EXIST`, `NONE`) and `PolicyHashCondition` are checked against the stored policy and fail with `ConditionCheckFailureException`. |
+| GetResourcePolicy | Returns the catalog policy with its hash and timestamps, or `EntityNotFoundException` when none is set. |
+| GetResourcePolicies | Lists the catalog policy (zero or one entry) under `GetResourcePoliciesResponseList`, paged. |
+| DeleteResourcePolicy | Deletes the catalog policy; honours `PolicyHashCondition`; `EntityNotFoundException` when none is set. |
+
+The catalog holds one policy, as on AWS. `PolicyInJson` must be a JSON object. AWS documents `PolicyHash` only as
+an opaque value to echo back; Floci derives it from the document, so the same policy always has the same hash.
+`ResourceArn` ("for internal use only" in the reference) and `EnableHybrid` are accepted. Per-resource policies
+that Resource Access Manager creates on AWS are not emulated, so `GetResourcePolicies` never has more than one entry.
+
+#### Encryption settings
+
+| Action | Description |
+|--------|-------------|
+| GetDataCatalogEncryptionSettings | Returns the catalog's security configuration: `EncryptionAtRest` (`CatalogEncryptionMode` `DISABLED` by default) and `ConnectionPasswordEncryption` (`ReturnConnectionPasswordEncrypted` false by default). |
+| PutDataCatalogEncryptionSettings | Replaces the configuration. `CatalogEncryptionMode` is `DISABLED`, `SSE-KMS` or `SSE-KMS-WITH-SERVICE-ROLE`; `ReturnConnectionPasswordEncrypted` is required inside its block. A block left out keeps its default. |
+
+`EncryptionAtRest` is stored and reported; catalog metadata is not encrypted on disk, which nothing observes through
+the API. `ConnectionPasswordEncryption` is applied: while `ReturnConnectionPasswordEncrypted` is true, a connection
+created or updated has each password property encrypted with `AwsKmsKeyId` through Floci's KMS and stored under the
+name the `Connection` structure documents for it (`PASSWORD` as `ENCRYPTED_PASSWORD`, and the four Kafka passwords as
+their `ENCRYPTED_KAFKA_*` forms). Reads return the ciphertext, base64-encoded, which `KMS.Decrypt` turns back into
+the password. A missing key, or none configured, fails the create or update with `GlueEncryptionException`, as on AWS.
+Connections created before the setting was switched on keep their plaintext, also as on AWS, where the choice is made
+when the connection is created or updated.
 
 #### Jobs
 

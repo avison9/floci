@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.glue.schemaregistry.GlueSchemaRegistryService;
+import io.github.hectorvent.floci.services.kms.KmsService;
 import io.github.hectorvent.floci.services.resourcegroupstagging.ResourceGroupsTaggingService;
 import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.BeforeEach;
@@ -41,7 +42,8 @@ class GlueJsonHandlerTest {
         GlueSchemaRegistryService schemaRegistryService =
                 new GlueSchemaRegistryService(storageFactory, regionResolver);
         GlueService glueService = new GlueService(
-                storageFactory, schemaRegistryService, regionResolver, new ResourceGroupsTaggingService(storageFactory));
+                storageFactory, schemaRegistryService, regionResolver, new ResourceGroupsTaggingService(storageFactory),
+                new KmsService(storageFactory, regionResolver));
         handler = new GlueJsonHandler(glueService, schemaRegistryService, mapper);
     }
 
@@ -736,5 +738,59 @@ class GlueJsonHandlerTest {
         inline.put("ConnectionType", "JDBC");
         inline.putObject("ConnectionProperties").put("JDBC_CONNECTION_URL", "jdbc:mysql://h:3306/d");
         assertEquals(200, handler.handle("TestConnection", test, REGION).getStatus());
+    }
+
+    @Test
+    void resourcePolicyOperationsAnswerWithTheDocumentedBodies() throws Exception {
+        String policy = "{\"Version\":\"2012-10-17\",\"Statement\":[]}";
+        ObjectNode put = mapper.createObjectNode();
+        put.put("PolicyInJson", policy);
+        put.put("PolicyExistsCondition", "NOT_EXIST");
+        JsonNode putBody = mapper.valueToTree(handler.handle("PutResourcePolicy", put, REGION).getEntity());
+        String hash = putBody.get("PolicyHash").asText();
+        assertFalse(hash.isBlank());
+
+        JsonNode got = mapper.valueToTree(handler.handle("GetResourcePolicy", mapper.createObjectNode(), REGION).getEntity());
+        assertEquals(policy, got.get("PolicyInJson").asText());
+        assertEquals(hash, got.get("PolicyHash").asText());
+        assertTrue(got.get("CreateTime").isNumber());
+        assertTrue(got.get("UpdateTime").isNumber());
+
+        JsonNode list = mapper.valueToTree(handler.handle("GetResourcePolicies", mapper.createObjectNode(), REGION).getEntity());
+        assertEquals(1, list.get("GetResourcePoliciesResponseList").size());
+        assertEquals(hash, list.get("GetResourcePoliciesResponseList").get(0).get("PolicyHash").asText());
+        assertFalse(list.has("NextToken"));
+
+        AwsException conflict = assertThrows(AwsException.class, () -> handler.handle("PutResourcePolicy", put, REGION));
+        assertEquals("ConditionCheckFailureException", conflict.getErrorCode());
+
+        Response deleted = handler.handle("DeleteResourcePolicy", mapper.createObjectNode(), REGION);
+        assertEquals(0, mapper.valueToTree(deleted.getEntity()).size());
+        AwsException gone = assertThrows(AwsException.class,
+                () -> handler.handle("GetResourcePolicy", mapper.createObjectNode(), REGION));
+        assertEquals("EntityNotFoundException", gone.getErrorCode());
+    }
+
+    @Test
+    void encryptionSettingsReportBothBlocksBeforeAndAfterAPut() throws Exception {
+        JsonNode defaults = mapper.valueToTree(
+                handler.handle("GetDataCatalogEncryptionSettings", mapper.createObjectNode(), REGION).getEntity());
+        JsonNode settings = defaults.get("DataCatalogEncryptionSettings");
+        assertEquals("DISABLED", settings.get("EncryptionAtRest").get("CatalogEncryptionMode").asText());
+        assertFalse(settings.get("EncryptionAtRest").has("SseAwsKmsKeyId"));
+        assertFalse(settings.get("ConnectionPasswordEncryption").get("ReturnConnectionPasswordEncrypted").asBoolean());
+
+        ObjectNode put = mapper.createObjectNode();
+        ObjectNode block = put.putObject("DataCatalogEncryptionSettings").putObject("ConnectionPasswordEncryption");
+        block.put("ReturnConnectionPasswordEncrypted", true);
+        block.put("AwsKmsKeyId", "alias/glue");
+        assertEquals(0, mapper.valueToTree(handler.handle("PutDataCatalogEncryptionSettings", put, REGION).getEntity()).size());
+
+        JsonNode after = mapper.valueToTree(
+                handler.handle("GetDataCatalogEncryptionSettings", mapper.createObjectNode(), REGION).getEntity())
+                .get("DataCatalogEncryptionSettings");
+        assertTrue(after.get("ConnectionPasswordEncryption").get("ReturnConnectionPasswordEncrypted").asBoolean());
+        assertEquals("alias/glue", after.get("ConnectionPasswordEncryption").get("AwsKmsKeyId").asText());
+        assertEquals("DISABLED", after.get("EncryptionAtRest").get("CatalogEncryptionMode").asText());
     }
 }
