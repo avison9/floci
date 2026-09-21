@@ -2087,8 +2087,15 @@ class RdsServiceTest {
                 20, false, null, null, "aurora-cluster", null, false, false, null,
                 Map.of(), List.of(), null, null, true, DbInstanceSettings.defaults());
         AwsException member = assertThrows(AwsException.class, () -> rdsService.stopDbInstance("aurora-member", null));
-        assertEquals("InvalidDBInstanceState", member.getErrorCode());
+        assertEquals("InvalidDBClusterStateFault", member.getErrorCode());
         assertTrue(member.getMessage().contains("StopDBCluster"));
+        // A stopped cluster's member cannot be started on its own either.
+        rdsService.stopDbCluster("aurora-cluster", "us-east-1");
+        AwsException startMember = assertThrows(AwsException.class, () -> rdsService.startDbInstance("aurora-member"));
+        assertEquals("InvalidDBClusterStateFault", startMember.getErrorCode());
+        assertTrue(startMember.getMessage().contains("StartDBCluster"));
+        assertEquals(DbInstanceStatus.STOPPED, rdsService.getDbInstance("aurora-member").getStatus());
+        rdsService.startDbCluster("aurora-cluster", "us-east-1");
 
         when(containerManager.tryStart(any(), any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenAnswer(invocation -> new RdsContainerHandle(

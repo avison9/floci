@@ -2243,6 +2243,15 @@ public class RdsService implements Resettable, ResourceProvider {
 
     // ── Stop, start and reboot ────────────────────────────────────────────────
 
+    /** Aurora members are stopped and started through their cluster; the model lists InvalidDBClusterStateFault for both calls. */
+    private static void refuseClusterMember(DbInstance instance, String id, String clusterOperation) {
+        if (instance.getDbClusterIdentifier() != null && !instance.getDbClusterIdentifier().isBlank()) {
+            throw new AwsException("InvalidDBClusterStateFault",
+                    "DB instance " + id + " is a member of DB cluster " + instance.getDbClusterIdentifier()
+                            + "; use " + clusterOperation + " on the cluster.", 400);
+        }
+    }
+
     private static boolean isStoppedOrInTransit(DbInstanceStatus status) {
         return status == DbInstanceStatus.STOPPING || status == DbInstanceStatus.STOPPED
                 || status == DbInstanceStatus.STARTING;
@@ -2262,11 +2271,7 @@ public class RdsService implements Resettable, ResourceProvider {
         String effectiveRegion = effectiveRegion(region);
         String accountId = currentAccountId();
         DbInstance instance = getDbInstance(id, effectiveRegion);
-        if (instance.getDbClusterIdentifier() != null && !instance.getDbClusterIdentifier().isBlank()) {
-            throw new AwsException("InvalidDBInstanceState",
-                    "DB instance " + id + " is a member of DB cluster " + instance.getDbClusterIdentifier()
-                            + "; stop the cluster with StopDBCluster.", 400);
-        }
+        refuseClusterMember(instance, id, "StopDBCluster");
         if (instance.getReadReplicaSourceDbInstanceIdentifier() != null
                 || !instance.getReadReplicaDbInstanceIdentifiers().isEmpty()) {
             throw new AwsException("InvalidDBInstanceState",
@@ -2315,6 +2320,10 @@ public class RdsService implements Resettable, ResourceProvider {
         String effectiveRegion = effectiveRegion(region);
         String accountId = currentAccountId();
         DbInstance instance = getDbInstance(id, effectiveRegion);
+        // A stopped cluster's members are stopped with it and only StartDBCluster brings them
+        // back: started alone, a member would get a standalone container on its own volume
+        // while the cluster stayed stopped.
+        refuseClusterMember(instance, id, "StartDBCluster");
         if (instance.getStatus() != DbInstanceStatus.STOPPED) {
             throw new AwsException("InvalidDBInstanceState",
                     "DB instance " + id + " is not in stopped state.", 400);
@@ -2375,7 +2384,7 @@ public class RdsService implements Resettable, ResourceProvider {
      * Stops an available cluster and its members: the cluster's proxy and container go away,
      * every member's proxy with them, and all of them report "stopped" until StartDBCluster.
      */
-    public DbCluster stopDbCluster(String id, String region) {
+    public synchronized DbCluster stopDbCluster(String id, String region) {
         String effectiveRegion = effectiveRegion(region);
         String accountId = currentAccountId();
         DbCluster cluster = getDbCluster(id, effectiveRegion);
@@ -2423,7 +2432,7 @@ public class RdsService implements Resettable, ResourceProvider {
     }
 
     /** Starts a stopped cluster and its members on the cluster's kept volume. */
-    public DbCluster startDbCluster(String id, String region) {
+    public synchronized DbCluster startDbCluster(String id, String region) {
         String effectiveRegion = effectiveRegion(region);
         String accountId = currentAccountId();
         DbCluster cluster = getDbCluster(id, effectiveRegion);
@@ -2465,7 +2474,7 @@ public class RdsService implements Resettable, ResourceProvider {
     }
 
     /** Reboots a cluster: its container and proxies go down and come back on the same volume. */
-    public DbCluster rebootDbCluster(String id, String region) {
+    public synchronized DbCluster rebootDbCluster(String id, String region) {
         String effectiveRegion = effectiveRegion(region);
         String accountId = currentAccountId();
         DbCluster cluster = getDbCluster(id, effectiveRegion);
