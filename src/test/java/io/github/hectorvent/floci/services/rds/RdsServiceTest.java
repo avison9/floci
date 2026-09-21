@@ -2030,6 +2030,135 @@ class RdsServiceTest {
     }
 
     @Test
+    void stopAndStartDbInstanceReleaseAndRestoreTheContainerOnTheSameVolume() {
+        DbInstance created = rdsService.createDbInstance("standalone", "postgres", "16",
+                "admin", "password", "dbname", "db.t3.micro",
+                20, false, null, null, null);
+        String volume = created.getDockerVolumeName();
+        int port = created.getEndpoint().port();
+
+        DbInstance stopping = rdsService.stopDbInstance("standalone", null);
+        assertEquals(DbInstanceStatus.STOPPING, stopping.getStatus());
+        DbInstance stopped = rdsService.getDbInstance("standalone");
+        assertEquals(DbInstanceStatus.STOPPED, stopped.getStatus());
+        assertNull(stopped.getContainerId());
+        assertEquals(volume, stopped.getDockerVolumeName());
+        assertEquals(port, stopped.getEndpoint().port());
+        verify(containerManager).stop(any());
+        verify(proxyManager).stopProxy(any());
+
+        assertEquals("InvalidDBInstanceState", assertThrows(AwsException.class,
+                () -> rdsService.stopDbInstance("standalone", null)).getErrorCode());
+        assertEquals("InvalidDBInstanceState", assertThrows(AwsException.class,
+                () -> rdsService.modifyDbInstance("standalone", "new-password", null, null, null, null, null)).getErrorCode());
+
+        DbInstance starting = rdsService.startDbInstance("standalone");
+        assertEquals(DbInstanceStatus.STARTING, starting.getStatus());
+        DbInstance started = rdsService.getDbInstance("standalone");
+        assertEquals(DbInstanceStatus.AVAILABLE, started.getStatus());
+        assertEquals("cont-id", started.getContainerId());
+        assertEquals(port, started.getEndpoint().port());
+        verify(containerManager, times(2)).tryStart(any(), any(), any(), eq(volume), any(), any(), any(), any(), any());
+        verify(proxyManager, times(2)).startProxy(any(), any(), anyBoolean(), eq(port), any(), anyInt(),
+                any(), any(), any(), any(), any());
+        assertEquals("InvalidDBInstanceState", assertThrows(AwsException.class,
+                () -> rdsService.startDbInstance("standalone")).getErrorCode());
+    }
+
+    @Test
+    void stopDbInstanceTakesTheRequestedSnapshotFirst() {
+        rdsService.createDbInstance("standalone", "postgres", "16",
+                "admin", "password", "dbname", "db.t3.micro",
+                20, false, null, null, null);
+        when(containerManager.createPostgresSnapshot(any(), eq("admin"))).thenReturn("DUMP");
+
+        rdsService.stopDbInstance("standalone", "before-stop");
+
+        assertEquals("available", rdsService.describeDbSnapshots("before-stop", null).iterator().next().getStatus());
+        assertEquals(DbInstanceStatus.STOPPED, rdsService.getDbInstance("standalone").getStatus());
+    }
+
+    @Test
+    void stopDbInstanceRefusesClusterMembersAndReplicas() {
+        rdsService.createDbCluster("aurora-cluster", "aurora-postgresql", "16.3",
+                "admin", "password", "dbname", false, null);
+        rdsService.createDbInstance("aurora-member", "aurora-postgresql", "16.3",
+                "admin", "password", "dbname", "db.r6g.large",
+                20, false, null, null, "aurora-cluster", null, false, false, null,
+                Map.of(), List.of(), null, null, true, DbInstanceSettings.defaults());
+        AwsException member = assertThrows(AwsException.class, () -> rdsService.stopDbInstance("aurora-member", null));
+        assertEquals("InvalidDBInstanceState", member.getErrorCode());
+        assertTrue(member.getMessage().contains("StopDBCluster"));
+
+        when(containerManager.tryStart(any(), any(), any(), any(), any(), any(), any(), any(), any()))
+                .thenAnswer(invocation -> new RdsContainerHandle(
+                        "cont-" + invocation.getArgument(1), invocation.getArgument(1), "localhost", 5432));
+        createPostgresSource("primary");
+        when(containerManager.createPostgresSnapshot("cont-primary", "admin")).thenReturn("DUMP");
+        rdsService.createDbInstanceReadReplica(replicaRequest("primary-replica", "primary"), null);
+        assertEquals("InvalidDBInstanceState", assertThrows(AwsException.class,
+                () -> rdsService.stopDbInstance("primary", null)).getErrorCode());
+        assertEquals("InvalidDBInstanceState", assertThrows(AwsException.class,
+                () -> rdsService.stopDbInstance("primary-replica", null)).getErrorCode());
+    }
+
+    @Test
+    void stopStartAndRebootDbClusterCarryTheMembersAlong() {
+        DbCluster created = rdsService.createDbCluster("aurora-cluster", "aurora-postgresql", "16.3",
+                "admin", "password", "dbname", false, null);
+        rdsService.createDbInstance("aurora-member", "aurora-postgresql", "16.3",
+                "admin", "password", "dbname", "db.r6g.large",
+                20, false, null, null, "aurora-cluster", null, false, false, null,
+                Map.of(), List.of(), null, null, true, DbInstanceSettings.defaults());
+        int port = created.getEndpoint().port();
+
+        DbCluster stopping = rdsService.stopDbCluster("aurora-cluster", "us-east-1");
+        assertEquals(DbInstanceStatus.STOPPING, stopping.getStatus());
+        assertEquals(DbInstanceStatus.STOPPED, rdsService.getDbCluster("aurora-cluster").getStatus());
+        assertEquals(DbInstanceStatus.STOPPED, rdsService.getDbInstance("aurora-member").getStatus());
+        assertNull(rdsService.getDbCluster("aurora-cluster").getContainerId());
+        assertEquals("InvalidDBClusterStateFault", assertThrows(AwsException.class,
+                () -> rdsService.stopDbCluster("aurora-cluster", "us-east-1")).getErrorCode());
+        assertEquals("InvalidDBClusterStateFault", assertThrows(AwsException.class,
+                () -> rdsService.rebootDbCluster("aurora-cluster", "us-east-1")).getErrorCode());
+
+        DbCluster starting = rdsService.startDbCluster("aurora-cluster", "us-east-1");
+        assertEquals(DbInstanceStatus.STARTING, starting.getStatus());
+        DbCluster started = rdsService.getDbCluster("aurora-cluster");
+        assertEquals(DbInstanceStatus.AVAILABLE, started.getStatus());
+        assertEquals(port, started.getEndpoint().port());
+        assertEquals("cont-id", started.getContainerId());
+        assertEquals(DbInstanceStatus.AVAILABLE, rdsService.getDbInstance("aurora-member").getStatus());
+        assertEquals("InvalidDBClusterStateFault", assertThrows(AwsException.class,
+                () -> rdsService.startDbCluster("aurora-cluster", "us-east-1")).getErrorCode());
+
+        DbCluster rebooting = rdsService.rebootDbCluster("aurora-cluster", "us-east-1");
+        assertEquals(DbInstanceStatus.REBOOTING, rebooting.getStatus());
+        assertEquals(DbInstanceStatus.AVAILABLE, rdsService.getDbCluster("aurora-cluster").getStatus());
+        assertEquals(DbInstanceStatus.AVAILABLE, rdsService.getDbInstance("aurora-member").getStatus());
+        // create, start and reboot each brought the cluster container up once.
+        verify(containerManager, times(3)).tryStart(eq(created.getDbClusterArn()), any(), any(), any(), any(), any(), any(), any(), any());
+        assertEquals("DBClusterNotFoundFault", assertThrows(AwsException.class,
+                () -> rdsService.stopDbCluster("absent", "us-east-1")).getErrorCode());
+    }
+
+    @Test
+    void mockModeStopAndStartTouchNoContainerOrProxy() {
+        when(config.services().rds().mock()).thenReturn(true);
+        rdsService.createDbInstance("standalone", "postgres", "16",
+                "admin", "password", "dbname", "db.t3.micro",
+                20, false, null, null, null);
+
+        rdsService.stopDbInstance("standalone", null);
+        assertEquals(DbInstanceStatus.STOPPED, rdsService.getDbInstance("standalone").getStatus());
+        rdsService.startDbInstance("standalone");
+        assertEquals(DbInstanceStatus.AVAILABLE, rdsService.getDbInstance("standalone").getStatus());
+        verify(containerManager, never()).stop(any());
+        verify(containerManager, never()).tryStart(any(), any(), any(), any(), any(), any(), any(), any(), any());
+        verify(proxyManager, never()).stopProxy(any());
+    }
+
+    @Test
     void mockModeRebootSkipsContainerAndProxy() {
         when(config.services().rds().mock()).thenReturn(true);
         rdsService.createDbInstance("standalone", "postgres", "16",

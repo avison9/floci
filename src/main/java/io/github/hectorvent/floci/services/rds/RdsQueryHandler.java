@@ -40,6 +40,7 @@ import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.BiFunction;
 
 /**
  * Query-protocol handler for all RDS actions (form-encoded POST, XML response).
@@ -76,6 +77,11 @@ public class RdsQueryHandler {
                 case "DeleteDBInstance" -> handleDeleteDbInstance(params, region);
                 case "ModifyDBInstance" -> handleModifyDbInstance(params, region);
                 case "RebootDBInstance" -> handleRebootDbInstance(params, region);
+                case "StopDBInstance" -> handleStopDbInstance(params, region);
+                case "StartDBInstance" -> handleStartDbInstance(params, region);
+                case "StopDBCluster" -> handleStopDbCluster(params, region);
+                case "StartDBCluster" -> handleStartDbCluster(params, region);
+                case "RebootDBCluster" -> handleRebootDbCluster(params, region);
                 case "CreateDBInstanceReadReplica" -> handleCreateDbInstanceReadReplica(params, region);
                 case "PromoteReadReplica" -> handlePromoteReadReplica(params, region);
                 case "SwitchoverReadReplica" -> handleSwitchoverReadReplica(params, region);
@@ -601,6 +607,58 @@ public class RdsQueryHandler {
         try {
             service.deleteDbSubnetGroup(name, region);
             return Response.ok(AwsQueryResponse.envelope("DeleteDBSubnetGroup", AwsNamespaces.RDS, "")).build();
+        } catch (AwsException e) {
+            return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.RDS, e.getHttpStatus());
+        }
+    }
+
+    private Response handleStopDbInstance(MultivaluedMap<String, String> params, String region) {
+        String id = params.getFirst("DBInstanceIdentifier");
+        if (id == null || id.isBlank()) {
+            return AwsQueryResponse.error("InvalidParameterValue", "DBInstanceIdentifier is required.", AwsNamespaces.RDS, 400);
+        }
+        try {
+            DbInstance instance = service.stopDbInstance(id, params.getFirst("DBSnapshotIdentifier"), region);
+            return Response.ok(AwsQueryResponse.envelope("StopDBInstance", AwsNamespaces.RDS, dbInstanceXml(instance))).build();
+        } catch (AwsException e) {
+            return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.RDS, e.getHttpStatus());
+        }
+    }
+
+    private Response handleStartDbInstance(MultivaluedMap<String, String> params, String region) {
+        String id = params.getFirst("DBInstanceIdentifier");
+        if (id == null || id.isBlank()) {
+            return AwsQueryResponse.error("InvalidParameterValue", "DBInstanceIdentifier is required.", AwsNamespaces.RDS, 400);
+        }
+        try {
+            DbInstance instance = service.startDbInstance(id, region);
+            return Response.ok(AwsQueryResponse.envelope("StartDBInstance", AwsNamespaces.RDS, dbInstanceXml(instance))).build();
+        } catch (AwsException e) {
+            return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.RDS, e.getHttpStatus());
+        }
+    }
+
+    private Response handleStopDbCluster(MultivaluedMap<String, String> params, String region) {
+        return clusterLifecycleResponse("StopDBCluster", params, region, service::stopDbCluster);
+    }
+
+    private Response handleStartDbCluster(MultivaluedMap<String, String> params, String region) {
+        return clusterLifecycleResponse("StartDBCluster", params, region, service::startDbCluster);
+    }
+
+    private Response handleRebootDbCluster(MultivaluedMap<String, String> params, String region) {
+        return clusterLifecycleResponse("RebootDBCluster", params, region, service::rebootDbCluster);
+    }
+
+    private Response clusterLifecycleResponse(String action, MultivaluedMap<String, String> params, String region,
+                                              BiFunction<String, String, DbCluster> operation) {
+        String id = params.getFirst("DBClusterIdentifier");
+        if (id == null || id.isBlank()) {
+            return AwsQueryResponse.error("InvalidParameterValue", "DBClusterIdentifier is required.", AwsNamespaces.RDS, 400);
+        }
+        try {
+            DbCluster cluster = operation.apply(id, region);
+            return Response.ok(AwsQueryResponse.envelope(action, AwsNamespaces.RDS, dbClusterXml(cluster))).build();
         } catch (AwsException e) {
             return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.RDS, e.getHttpStatus());
         }
@@ -2491,6 +2549,9 @@ public class RdsQueryHandler {
             case REBOOTING -> "rebooting";
             case MODIFYING -> "modifying";
             case FAILED -> "failed";
+            case STOPPING -> "stopping";
+            case STOPPED -> "stopped";
+            case STARTING -> "starting";
         };
     }
 

@@ -2,7 +2,9 @@ package io.github.hectorvent.floci.services.rds;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
@@ -80,6 +82,12 @@ public class RdsService implements Resettable, ResourceProvider {
 
     private static final Logger LOG = Logger.getLogger(RdsService.class);
     private static final ObjectMapper JSON = new ObjectMapper();
+    // Copies a record for a response that must report a transitional status ("stopping",
+    // "starting") while the stored record settles to the final one in the same call. The
+    // records already round-trip through Jackson for persistence.
+    private static final ObjectMapper RESPONSE_COPIER = new ObjectMapper()
+            .registerModule(new JavaTimeModule())
+            .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
     private static final Duration EVENT_RETENTION = Duration.ofDays(14);
     /** Value AWS reports as the OwningService of a secret RDS manages. */
     private static final String MANAGED_SECRET_OWNING_SERVICE = "rds";
@@ -2042,6 +2050,12 @@ public class RdsService implements Resettable, ResourceProvider {
         validateInstanceSettings(settings);
         String effectiveRegion = effectiveRegion(region);
         DbInstance instance = getDbInstance(id, effectiveRegion);
+        // "You can't modify a stopped DB instance" (user guide, stopping an instance temporarily).
+        if (isStoppedOrInTransit(instance.getStatus())) {
+            throw new AwsException("InvalidDBInstanceState",
+                    "DB instance " + id + " is in state " + instance.getStatus().name().toLowerCase(Locale.ROOT)
+                            + " and cannot be modified.", 400);
+        }
         DbInstanceSettings effective = withEffectiveWindows(settings, instance);
         instance.setStatus(DbInstanceStatus.AVAILABLE);
         if (optionGroupName != null && !optionGroupName.isBlank()) {
@@ -2225,6 +2239,329 @@ public class RdsService implements Resettable, ResourceProvider {
                 .filter(option -> dbInstanceClass == null || dbInstanceClass.isBlank()
                         || dbInstanceClass.equalsIgnoreCase(option.get("dbInstanceClass")))
                 .toList();
+    }
+
+    // ── Stop, start and reboot ────────────────────────────────────────────────
+
+    private static boolean isStoppedOrInTransit(DbInstanceStatus status) {
+        return status == DbInstanceStatus.STOPPING || status == DbInstanceStatus.STOPPED
+                || status == DbInstanceStatus.STARTING;
+    }
+
+    /**
+     * Stops an available standalone instance: an optional snapshot first, then the proxy and
+     * the container go away while the record, its endpoint and its storage volume stay, so
+     * StartDBInstance brings the same database back. The response reports "stopping" and the
+     * stored instance settles to "stopped", the two statuses the user guide describes.
+     */
+    public DbInstance stopDbInstance(String id, String snapshotId) {
+        return stopDbInstance(id, snapshotId, regionResolver.getDefaultRegion());
+    }
+
+    public synchronized DbInstance stopDbInstance(String id, String snapshotId, String region) {
+        String effectiveRegion = effectiveRegion(region);
+        String accountId = currentAccountId();
+        DbInstance instance = getDbInstance(id, effectiveRegion);
+        if (instance.getDbClusterIdentifier() != null && !instance.getDbClusterIdentifier().isBlank()) {
+            throw new AwsException("InvalidDBInstanceState",
+                    "DB instance " + id + " is a member of DB cluster " + instance.getDbClusterIdentifier()
+                            + "; stop the cluster with StopDBCluster.", 400);
+        }
+        if (instance.getReadReplicaSourceDbInstanceIdentifier() != null
+                || !instance.getReadReplicaDbInstanceIdentifiers().isEmpty()) {
+            throw new AwsException("InvalidDBInstanceState",
+                    "DB instance " + id + " has a read replica or is a read replica and cannot be stopped.", 400);
+        }
+        if (instance.getStatus() != DbInstanceStatus.AVAILABLE) {
+            throw new AwsException("InvalidDBInstanceState",
+                    "DB instance " + id + " is not in available state.", 400);
+        }
+        if (snapshotId != null && !snapshotId.isBlank()) {
+            createDbSnapshot(snapshotId, id, null, effectiveRegion);
+        }
+
+        instance.setStatus(DbInstanceStatus.STOPPING);
+        putInstanceForScope(accountId, effectiveRegion, id, instance);
+        DbInstance response = RESPONSE_COPIER.convertValue(instance, DbInstance.class);
+
+        if (!config.services().rds().mock()) {
+            proxyManager.stopProxy(rdsResourceRelayKey(instance.getDbInstanceArn(), id));
+            if (instance.getContainerId() != null) {
+                try {
+                    containerManager.stop(buildHandle(instance));
+                } catch (RuntimeException | Error e) {
+                    instance.setStatus(DbInstanceStatus.FAILED);
+                    putInstanceForScope(accountId, effectiveRegion, id, instance);
+                    throw e;
+                }
+            }
+            // The volume stays; only the container is gone until StartDBInstance.
+            instance.setContainerId(null);
+            instance.setContainerHost(null);
+            instance.setContainerPort(0);
+        }
+        instance.setStatus(DbInstanceStatus.STOPPED);
+        putInstanceForScope(accountId, effectiveRegion, id, instance);
+        LOG.infov("DB instance {0} stopped", id);
+        return response;
+    }
+
+    /** Starts a stopped instance on the volume it kept; the response reports "starting". */
+    public DbInstance startDbInstance(String id) {
+        return startDbInstance(id, regionResolver.getDefaultRegion());
+    }
+
+    public synchronized DbInstance startDbInstance(String id, String region) {
+        String effectiveRegion = effectiveRegion(region);
+        String accountId = currentAccountId();
+        DbInstance instance = getDbInstance(id, effectiveRegion);
+        if (instance.getStatus() != DbInstanceStatus.STOPPED) {
+            throw new AwsException("InvalidDBInstanceState",
+                    "DB instance " + id + " is not in stopped state.", 400);
+        }
+        instance.setStatus(DbInstanceStatus.STARTING);
+        putInstanceForScope(accountId, effectiveRegion, id, instance);
+        DbInstance response = RESPONSE_COPIER.convertValue(instance, DbInstance.class);
+
+        if (!config.services().rds().mock()) {
+            startStandaloneInstanceBackend(instance, id, effectiveRegion);
+        }
+        instance.setStatus(DbInstanceStatus.AVAILABLE);
+        putInstanceForScope(accountId, effectiveRegion, id, instance);
+        LOG.infov("DB instance {0} started", id);
+        return response;
+    }
+
+    /**
+     * Brings a standalone instance's container up on its existing volume and its proxy with
+     * it, the way a reboot does after stopping them.
+     */
+    private void startStandaloneInstanceBackend(DbInstance instance, String id, String effectiveRegion) {
+        String image = imageForEngine(instance.getEngine(), instance.getEngineVersion());
+        String storageResourceId = resolvedInstanceStorageResourceId(instance);
+        String dockerVolumeName = resolvedInstanceDockerVolumeName(instance);
+        RdsContainerHandle handle;
+        try {
+            handle = containerManager.tryStart(
+                    instance.getDbInstanceArn(), id, storageResourceId,
+                    dockerVolumeName, instance.getEngine(), image, instance.getMasterUsername(),
+                    instance.getMasterPassword(), instance.getDbName());
+        } catch (RuntimeException | Error e) {
+            instance.setStatus(DbInstanceStatus.FAILED);
+            putInstanceForScope(currentAccountId(), effectiveRegion, id, instance);
+            throw e;
+        }
+        instance.setContainerStorageResourceId(storageResourceId);
+        instance.setDockerVolumeName(dockerVolumeName);
+        instance.setContainerId(handle != null ? handle.getContainerId() : null);
+        instance.setContainerHost(handle != null ? handle.getHost() : null);
+        instance.setContainerPort(handle != null ? handle.getPort() : 0);
+        if (hasBackend(instance.getContainerHost(), instance.getContainerPort())) {
+            String effectiveMasterUser = instance.getMasterUsername() != null
+                    ? instance.getMasterUsername() : "root";
+            final String accountId = accountIdFromArn(instance.getDbInstanceArn());
+            final String instanceRegion = regionFromArn(instance.getDbInstanceArn());
+            proxyManager.startProxy(rdsResourceRelayKey(instance.getDbInstanceArn(), id),
+                    instance.getEngine(),
+                    instance.isIamDatabaseAuthenticationEnabled(),
+                    instance.getProxyPort(), instance.getContainerHost(), instance.getContainerPort(),
+                    instance.getEndpoint().address(),
+                    effectiveMasterUser, instance.getMasterPassword(), instance.getDbName(),
+                    (user, pw) -> validateDbPasswordForScope(accountId, instanceRegion, id, user, pw));
+        }
+    }
+
+    /**
+     * Stops an available cluster and its members: the cluster's proxy and container go away,
+     * every member's proxy with them, and all of them report "stopped" until StartDBCluster.
+     */
+    public DbCluster stopDbCluster(String id, String region) {
+        String effectiveRegion = effectiveRegion(region);
+        String accountId = currentAccountId();
+        DbCluster cluster = getDbCluster(id, effectiveRegion);
+        if (cluster.getStatus() != null && cluster.getStatus() != DbInstanceStatus.AVAILABLE) {
+            throw new AwsException("InvalidDBClusterStateFault",
+                    "DB cluster " + id + " is not in available state.", 400);
+        }
+        cluster.setStatus(DbInstanceStatus.STOPPING);
+        putClusterForScope(accountId, effectiveRegion, id, cluster);
+        DbCluster response = RESPONSE_COPIER.convertValue(cluster, DbCluster.class);
+
+        boolean mock = config.services().rds().mock();
+        for (String memberId : cluster.getDbClusterMembers()) {
+            DbInstance member = findInstanceForScope(accountId, effectiveRegion, memberId);
+            if (member == null) {
+                continue;
+            }
+            if (!mock) {
+                proxyManager.stopProxy(rdsResourceRelayKey(member.getDbInstanceArn(), memberId));
+            }
+            member.setStatus(DbInstanceStatus.STOPPED);
+            member.setContainerHost(null);
+            member.setContainerPort(0);
+            putInstanceForScope(accountId, effectiveRegion, memberId, member);
+        }
+        if (!mock) {
+            proxyManager.stopProxy(rdsResourceRelayKey(cluster.getDbClusterArn(), id));
+            if (cluster.getContainerId() != null) {
+                try {
+                    containerManager.stop(buildClusterHandle(cluster));
+                } catch (RuntimeException | Error e) {
+                    cluster.setStatus(DbInstanceStatus.FAILED);
+                    putClusterForScope(accountId, effectiveRegion, id, cluster);
+                    throw e;
+                }
+            }
+            cluster.setContainerId(null);
+            cluster.setContainerHost(null);
+            cluster.setContainerPort(0);
+        }
+        cluster.setStatus(DbInstanceStatus.STOPPED);
+        putClusterForScope(accountId, effectiveRegion, id, cluster);
+        LOG.infov("DB cluster {0} stopped", id);
+        return response;
+    }
+
+    /** Starts a stopped cluster and its members on the cluster's kept volume. */
+    public DbCluster startDbCluster(String id, String region) {
+        String effectiveRegion = effectiveRegion(region);
+        String accountId = currentAccountId();
+        DbCluster cluster = getDbCluster(id, effectiveRegion);
+        if (cluster.getStatus() != DbInstanceStatus.STOPPED) {
+            throw new AwsException("InvalidDBClusterStateFault",
+                    "DB cluster " + id + " is not in stopped state.", 400);
+        }
+        cluster.setStatus(DbInstanceStatus.STARTING);
+        putClusterForScope(accountId, effectiveRegion, id, cluster);
+        DbCluster response = RESPONSE_COPIER.convertValue(cluster, DbCluster.class);
+
+        if (!config.services().rds().mock()) {
+            startClusterBackend(cluster, id, effectiveRegion);
+        }
+        cluster.setStatus(DbInstanceStatus.AVAILABLE);
+        putClusterForScope(accountId, effectiveRegion, id, cluster);
+        for (String memberId : cluster.getDbClusterMembers()) {
+            DbInstance member = findInstanceForScope(accountId, effectiveRegion, memberId);
+            if (member == null) {
+                continue;
+            }
+            member.setContainerId(cluster.getContainerId());
+            member.setContainerHost(cluster.getContainerHost());
+            member.setContainerPort(cluster.getContainerPort());
+            if (!config.services().rds().mock() && hasBackend(cluster.getContainerHost(), cluster.getContainerPort())) {
+                final String memberRegion = regionFromArn(member.getDbInstanceArn());
+                proxyManager.startProxy(rdsResourceRelayKey(member.getDbInstanceArn(), memberId),
+                        member.getEngine(), member.isIamDatabaseAuthenticationEnabled(), member.getProxyPort(),
+                        cluster.getContainerHost(), cluster.getContainerPort(), member.getEndpoint().address(),
+                        member.getMasterUsername() != null ? member.getMasterUsername() : "root",
+                        member.getMasterPassword(), member.getDbName(),
+                        (user, pw) -> validateDbPasswordForScope(accountId, memberRegion, memberId, user, pw));
+            }
+            member.setStatus(DbInstanceStatus.AVAILABLE);
+            putInstanceForScope(accountId, effectiveRegion, memberId, member);
+        }
+        LOG.infov("DB cluster {0} started", id);
+        return response;
+    }
+
+    /** Reboots a cluster: its container and proxies go down and come back on the same volume. */
+    public DbCluster rebootDbCluster(String id, String region) {
+        String effectiveRegion = effectiveRegion(region);
+        String accountId = currentAccountId();
+        DbCluster cluster = getDbCluster(id, effectiveRegion);
+        if (cluster.getStatus() != null && cluster.getStatus() != DbInstanceStatus.AVAILABLE) {
+            throw new AwsException("InvalidDBClusterStateFault",
+                    "DB cluster " + id + " is not in available state.", 400);
+        }
+        cluster.setStatus(DbInstanceStatus.REBOOTING);
+        putClusterForScope(accountId, effectiveRegion, id, cluster);
+        DbCluster response = RESPONSE_COPIER.convertValue(cluster, DbCluster.class);
+        stopDbClusterRuntime(cluster, id, effectiveRegion, accountId);
+        if (!config.services().rds().mock()) {
+            startClusterBackend(cluster, id, effectiveRegion);
+        }
+        cluster.setStatus(DbInstanceStatus.AVAILABLE);
+        putClusterForScope(accountId, effectiveRegion, id, cluster);
+        for (String memberId : cluster.getDbClusterMembers()) {
+            DbInstance member = findInstanceForScope(accountId, effectiveRegion, memberId);
+            if (member == null) {
+                continue;
+            }
+            member.setContainerId(cluster.getContainerId());
+            member.setContainerHost(cluster.getContainerHost());
+            member.setContainerPort(cluster.getContainerPort());
+            if (!config.services().rds().mock() && hasBackend(cluster.getContainerHost(), cluster.getContainerPort())) {
+                final String memberRegion = regionFromArn(member.getDbInstanceArn());
+                proxyManager.startProxy(rdsResourceRelayKey(member.getDbInstanceArn(), memberId),
+                        member.getEngine(), member.isIamDatabaseAuthenticationEnabled(), member.getProxyPort(),
+                        cluster.getContainerHost(), cluster.getContainerPort(), member.getEndpoint().address(),
+                        member.getMasterUsername() != null ? member.getMasterUsername() : "root",
+                        member.getMasterPassword(), member.getDbName(),
+                        (user, pw) -> validateDbPasswordForScope(accountId, memberRegion, memberId, user, pw));
+            }
+            member.setStatus(DbInstanceStatus.AVAILABLE);
+            putInstanceForScope(accountId, effectiveRegion, memberId, member);
+        }
+        LOG.infov("DB cluster {0} rebooted", id);
+        return response;
+    }
+
+    private void stopDbClusterRuntime(DbCluster cluster, String id, String effectiveRegion, String accountId) {
+        if (config.services().rds().mock()) {
+            return;
+        }
+        for (String memberId : cluster.getDbClusterMembers()) {
+            DbInstance member = findInstanceForScope(accountId, effectiveRegion, memberId);
+            if (member != null) {
+                proxyManager.stopProxy(rdsResourceRelayKey(member.getDbInstanceArn(), memberId));
+            }
+        }
+        proxyManager.stopProxy(rdsResourceRelayKey(cluster.getDbClusterArn(), id));
+        if (cluster.getContainerId() != null) {
+            try {
+                containerManager.stop(buildClusterHandle(cluster));
+            } catch (RuntimeException | Error e) {
+                cluster.setStatus(DbInstanceStatus.FAILED);
+                putClusterForScope(accountId, effectiveRegion, id, cluster);
+                throw e;
+            }
+        }
+        cluster.setContainerId(null);
+        cluster.setContainerHost(null);
+        cluster.setContainerPort(0);
+    }
+
+    /** Brings a cluster's container up on its existing volume and its proxy with it. */
+    private void startClusterBackend(DbCluster cluster, String id, String effectiveRegion) {
+        String image = imageForEngine(cluster.getEngine(), cluster.getEngineVersion());
+        String storageResourceId = resolvedClusterStorageResourceId(cluster);
+        String dockerVolumeName = resolvedClusterDockerVolumeName(cluster);
+        RdsContainerHandle handle;
+        try {
+            handle = containerManager.tryStart(
+                    cluster.getDbClusterArn(), id, storageResourceId, dockerVolumeName,
+                    cluster.getEngine(), image, cluster.getMasterUsername(), cluster.getMasterPassword(),
+                    cluster.getDatabaseName());
+        } catch (RuntimeException | Error e) {
+            cluster.setStatus(DbInstanceStatus.FAILED);
+            putClusterForScope(currentAccountId(), effectiveRegion, id, cluster);
+            throw e;
+        }
+        cluster.setContainerStorageResourceId(storageResourceId);
+        cluster.setDockerVolumeName(dockerVolumeName);
+        cluster.setContainerId(handle != null ? handle.getContainerId() : null);
+        cluster.setContainerHost(handle != null ? handle.getHost() : null);
+        cluster.setContainerPort(handle != null ? handle.getPort() : 0);
+        if (handle != null) {
+            final String accountId = accountIdFromArn(cluster.getDbClusterArn());
+            final String clusterRegion = regionFromArn(cluster.getDbClusterArn());
+            proxyManager.startProxy(rdsResourceRelayKey(cluster.getDbClusterArn(), id),
+                    cluster.getEngine(), cluster.isIamDatabaseAuthenticationEnabled(), cluster.getProxyPort(),
+                    handle.getHost(), handle.getPort(), cluster.getEndpoint().address(),
+                    cluster.getMasterUsername() != null ? cluster.getMasterUsername() : "root",
+                    cluster.getMasterPassword(), cluster.getDatabaseName(),
+                    (user, pw) -> validateDbClusterPasswordForScope(accountId, clusterRegion, id, user, pw));
+        }
     }
 
     public DbInstance rebootDbInstance(String id) {
@@ -6014,6 +6351,20 @@ public class RdsService implements Resettable, ResourceProvider {
             if (cluster.getStatus() == DbInstanceStatus.DELETING) {
                 continue;
             }
+            if (cluster.getStatus() == DbInstanceStatus.STOPPED) {
+                // A stopped cluster stays stopped across an emulator restart; StartDBCluster
+                // brings its container back. Its endpoint keeps its port when that port is free.
+                int port = reserveOrAllocateProxyPort(cluster.getProxyPort());
+                if (port != cluster.getProxyPort()) {
+                    cluster.setProxyPort(port);
+                    DbEndpoint endpoint = proxyEndpoint(port);
+                    cluster.setEndpoint(endpoint);
+                    cluster.setReaderEndpoint(endpoint);
+                    putClusterForScope(accountIdFromArn(cluster.getDbClusterArn()),
+                            regionFromArn(cluster.getDbClusterArn()), cluster.getDbClusterIdentifier(), cluster);
+                }
+                continue;
+            }
             String accountId = accountIdFromArn(cluster.getDbClusterArn());
             String clusterRegion = regionFromArn(cluster.getDbClusterArn());
             String storageResourceId = resolvedClusterStorageResourceId(cluster);
@@ -6107,6 +6458,17 @@ public class RdsService implements Resettable, ResourceProvider {
     private void restoreInstances() {
         for (DbInstance instance : allInstances()) {
             if (instance.getStatus() == DbInstanceStatus.DELETING) {
+                continue;
+            }
+            if (instance.getStatus() == DbInstanceStatus.STOPPED) {
+                // Stays stopped across a restart; StartDBInstance brings the container back.
+                int port = reserveOrAllocateProxyPort(instance.getProxyPort());
+                if (port != instance.getProxyPort()) {
+                    instance.setProxyPort(port);
+                    instance.setEndpoint(proxyEndpoint(port));
+                    putInstanceForScope(accountIdFromArn(instance.getDbInstanceArn()),
+                            regionFromArn(instance.getDbInstanceArn()), instance.getDbInstanceIdentifier(), instance);
+                }
                 continue;
             }
             String accountId = accountIdFromArn(instance.getDbInstanceArn());

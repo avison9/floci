@@ -18,6 +18,11 @@ RDS Data API (`rds-data`) is documented separately because it uses REST JSON rou
 | `DeleteDBInstance` | Stop and remove an instance |
 | `ModifyDBInstance` | Update instance settings |
 | `RebootDBInstance` | Restart a database instance |
+| `StopDBInstance` | Stop a standalone instance temporarily: an optional `DBSnapshotIdentifier` first, then its container goes away while the record, endpoint and volume stay |
+| `StartDBInstance` | Start a stopped instance on the volume it kept, same endpoint |
+| `StopDBCluster` | Stop a cluster and its member instances |
+| `StartDBCluster` | Start a stopped cluster and its members |
+| `RebootDBCluster` | Restart a cluster's database and its members' proxies |
 | `CreateDBInstanceReadReplica` | Create a read replica of a PostgreSQL instance, initialised from a copy of the source; see [Read replicas](#read-replicas) |
 | `PromoteReadReplica` | Detach a read replica into a standalone instance and turn automated backups on |
 | `SwitchoverReadReplica` | Refused with `InvalidDBInstanceState`: AWS supports switchover only for Oracle and SQL Server replicas, neither of which is emulated |
@@ -94,6 +99,20 @@ Floci uses `04:00-06:00` and `mon:00:00-mon:03:00` (or, when the window given on
 usual default, a 30-minute window starting where the given one ends); a window given on modify is
 checked against the instance's other window. Modifications apply immediately —
 `PendingModifiedValues` is not modeled.
+
+!!! note "Stopping and starting"
+
+    `StopDBInstance` and `StopDBCluster` follow the user guide: the response reports `stopping`
+    (`StopDBCluster` for the cluster and its members), the stored status settles to `stopped`,
+    and `StartDBInstance` / `StartDBCluster` report `starting` and settle to `available`. While
+    stopped, the identifier, endpoint (same port), parameter and option groups and the Docker
+    volume all stay, so the data comes back on start; the container itself is removed and the
+    endpoint refuses connections. `StopDBInstance` refuses a cluster member (use `StopDBCluster`),
+    a read replica or an instance that has one, and anything not `available`, with
+    `InvalidDBInstanceState`; `ModifyDBInstance` on a stopped instance is refused the same way.
+    `DeleteDBInstance` works on a stopped instance. A stopped instance or cluster stays stopped
+    across an emulator restart. Not modeled: the automatic restart after seven days, and the
+    Multi-AZ SQL Server restriction.
 
 !!! note "DB snapshot tagging and lifecycle"
 

@@ -14,7 +14,9 @@ import software.amazon.awssdk.services.rds.model.ConnectionPoolConfigurationInfo
 import software.amazon.awssdk.services.rds.model.CreateDbProxyResponse;
 import software.amazon.awssdk.services.rds.model.CreateDbSubnetGroupResponse;
 import software.amazon.awssdk.services.rds.model.CreateOptionGroupResponse;
+import software.amazon.awssdk.services.rds.model.DBInstance;
 import software.amazon.awssdk.services.rds.model.DBProxyTarget;
+import software.amazon.awssdk.services.rds.model.InvalidDbInstanceStateException;
 import software.amazon.awssdk.services.rds.model.DescribeDbSubnetGroupsResponse;
 import software.amazon.awssdk.services.rds.model.DescribeOptionGroupsResponse;
 import software.amazon.awssdk.services.rds.model.DescribeOrderableDbInstanceOptionsResponse;
@@ -391,6 +393,36 @@ class RdsControlPlaneTest {
             }
             deleteProxy(rds, targetProxyName);
             deleteDbInstance(rds, targetInstanceName);
+        }
+    }
+
+    @Test
+    void sdkStopsAndStartsAStandaloneInstance() throws Exception {
+        String instanceName = TestFixtures.uniqueName("rds-stop-db");
+        try {
+            createDbInstance(rds, instanceName, "stop-secret");
+            String endpoint = rds.describeDBInstances(b -> b.dbInstanceIdentifier(instanceName))
+                    .dbInstances().get(0).endpoint().address();
+
+            DBInstance stopping = rds.stopDBInstance(b -> b.dbInstanceIdentifier(instanceName)).dbInstance();
+            assertThat(stopping.dbInstanceStatus()).isEqualTo("stopping");
+            assertThat(rds.describeDBInstances(b -> b.dbInstanceIdentifier(instanceName))
+                    .dbInstances().get(0).dbInstanceStatus()).isEqualTo("stopped");
+
+            assertThatThrownBy(() -> rds.stopDBInstance(b -> b.dbInstanceIdentifier(instanceName)))
+                    .isInstanceOf(InvalidDbInstanceStateException.class);
+            assertThatThrownBy(() -> rds.modifyDBInstance(b -> b
+                    .dbInstanceIdentifier(instanceName).masterUserPassword("changed-secret")))
+                    .isInstanceOf(InvalidDbInstanceStateException.class);
+
+            DBInstance starting = rds.startDBInstance(b -> b.dbInstanceIdentifier(instanceName)).dbInstance();
+            assertThat(starting.dbInstanceStatus()).isEqualTo("starting");
+            DBInstance started = rds.describeDBInstances(b -> b.dbInstanceIdentifier(instanceName))
+                    .dbInstances().get(0);
+            assertThat(started.dbInstanceStatus()).isEqualTo("available");
+            assertThat(started.endpoint().address()).isEqualTo(endpoint);
+        } finally {
+            deleteDbInstance(rds, instanceName);
         }
     }
 

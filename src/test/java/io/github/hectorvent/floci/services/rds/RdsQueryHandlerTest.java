@@ -1914,6 +1914,44 @@ class RdsQueryHandlerTest {
     }
 
     @Test
+    void stopStartAndRebootActions_dispatchAndRenderTransitionalStatuses() {
+        DbInstance stopping = makeInstance("standalone");
+        stopping.setStatus(io.github.hectorvent.floci.services.rds.model.DbInstanceStatus.STOPPING);
+        when(service.stopDbInstance(eq("standalone"), eq("before-stop"), isNull())).thenReturn(stopping);
+        MultivaluedMap<String, String> stop = params();
+        stop.add("DBInstanceIdentifier", "standalone");
+        stop.add("DBSnapshotIdentifier", "before-stop");
+        String stopBody = (String) handler.handle("StopDBInstance", stop).getEntity();
+        assertTrue(stopBody.contains("<StopDBInstanceResult>"));
+        assertTrue(stopBody.contains("<DBInstanceStatus>stopping</DBInstanceStatus>"));
+
+        DbInstance starting = makeInstance("standalone");
+        starting.setStatus(io.github.hectorvent.floci.services.rds.model.DbInstanceStatus.STARTING);
+        when(service.startDbInstance(eq("standalone"), isNull())).thenReturn(starting);
+        MultivaluedMap<String, String> start = params();
+        start.add("DBInstanceIdentifier", "standalone");
+        String startBody = (String) handler.handle("StartDBInstance", start).getEntity();
+        assertTrue(startBody.contains("<StartDBInstanceResult>"));
+        assertTrue(startBody.contains("<DBInstanceStatus>starting</DBInstanceStatus>"));
+
+        DbCluster cluster = new DbCluster();
+        cluster.setDbClusterIdentifier("aurora");
+        cluster.setStatus(io.github.hectorvent.floci.services.rds.model.DbInstanceStatus.STOPPED);
+        when(service.stopDbCluster(eq("aurora"), isNull())).thenReturn(cluster);
+        MultivaluedMap<String, String> stopCluster = params();
+        stopCluster.add("DBClusterIdentifier", "aurora");
+        String clusterBody = (String) handler.handle("StopDBCluster", stopCluster).getEntity();
+        assertTrue(clusterBody.contains("<StopDBClusterResult>"));
+        assertTrue(clusterBody.contains("<Status>stopped</Status>"));
+
+        assertEquals(400, handler.handle("StopDBInstance", params()).getStatus());
+        assertEquals(400, handler.handle("StartDBInstance", params()).getStatus());
+        assertEquals(400, handler.handle("StartDBCluster", params()).getStatus());
+        assertEquals(400, handler.handle("RebootDBCluster", params()).getStatus());
+        verify(service, never()).startDbCluster(any(), any());
+    }
+
+    @Test
     void describeDbSnapshotAttributes_returnsRestoreAttribute() {
         io.github.hectorvent.floci.services.rds.model.DbSnapshot snapshot = new io.github.hectorvent.floci.services.rds.model.DbSnapshot();
         snapshot.setDbSnapshotIdentifier("mysnap");
