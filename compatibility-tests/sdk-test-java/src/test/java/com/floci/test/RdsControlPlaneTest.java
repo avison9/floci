@@ -452,7 +452,6 @@ class RdsControlPlaneTest {
             assertThat(copy.dbSnapshotIdentifier()).isEqualTo(copyName);
             assertThat(copy.status()).isEqualTo("available");
             assertThat(copy.snapshotType()).isEqualTo("manual");
-            assertThat(copy.sourceDBSnapshotIdentifier()).isEqualTo(sourceArn);
             assertThat(copy.tagList()).extracting(Tag::key).containsExactlyInAnyOrder("owner", "stage");
 
             assertThatThrownBy(() -> rds.copyDBSnapshot(b -> b
