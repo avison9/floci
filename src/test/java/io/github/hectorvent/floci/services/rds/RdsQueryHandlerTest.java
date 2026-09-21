@@ -1916,7 +1916,7 @@ class RdsQueryHandlerTest {
     @Test
     void stopStartAndRebootActions_dispatchAndRenderTransitionalStatuses() {
         DbInstance stopping = makeInstance("standalone");
-        stopping.setStatus(io.github.hectorvent.floci.services.rds.model.DbInstanceStatus.STOPPING);
+        stopping.setStatus(DbInstanceStatus.STOPPING);
         when(service.stopDbInstance(eq("standalone"), eq("before-stop"), isNull())).thenReturn(stopping);
         MultivaluedMap<String, String> stop = params();
         stop.add("DBInstanceIdentifier", "standalone");
@@ -1926,7 +1926,7 @@ class RdsQueryHandlerTest {
         assertTrue(stopBody.contains("<DBInstanceStatus>stopping</DBInstanceStatus>"));
 
         DbInstance starting = makeInstance("standalone");
-        starting.setStatus(io.github.hectorvent.floci.services.rds.model.DbInstanceStatus.STARTING);
+        starting.setStatus(DbInstanceStatus.STARTING);
         when(service.startDbInstance(eq("standalone"), isNull())).thenReturn(starting);
         MultivaluedMap<String, String> start = params();
         start.add("DBInstanceIdentifier", "standalone");
@@ -1936,7 +1936,7 @@ class RdsQueryHandlerTest {
 
         DbCluster cluster = new DbCluster();
         cluster.setDbClusterIdentifier("aurora");
-        cluster.setStatus(io.github.hectorvent.floci.services.rds.model.DbInstanceStatus.STOPPED);
+        cluster.setStatus(DbInstanceStatus.STOPPED);
         when(service.stopDbCluster(eq("aurora"), isNull())).thenReturn(cluster);
         MultivaluedMap<String, String> stopCluster = params();
         stopCluster.add("DBClusterIdentifier", "aurora");
