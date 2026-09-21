@@ -113,6 +113,9 @@ public class RdsQueryHandler {
                 case "DescribeDBSnapshots" -> handleDescribeDbSnapshots(params, region);
                 case "DescribeDBSnapshotAttributes" -> handleDescribeDbSnapshotAttributes(params, region);
                 case "ModifyDBSnapshotAttribute" -> handleModifyDbSnapshotAttribute(params, region);
+                case "DeleteDBSnapshot" -> handleDeleteDbSnapshot(params, region);
+                case "CopyDBSnapshot" -> handleCopyDbSnapshot(params, region);
+                case "ModifyDBSnapshot" -> handleModifyDbSnapshot(params, region);
                 case "DescribeDBProxies" -> handleDescribeDbProxies(params, region);
                 case "CreateDBProxy" -> handleCreateDbProxy(params, region);
                 case "ModifyDBProxy" -> handleModifyDbProxy(params, region);
@@ -1344,6 +1347,52 @@ public class RdsQueryHandler {
         }
     }
 
+    private Response handleDeleteDbSnapshot(MultivaluedMap<String, String> params, String region) {
+        String snapshotId = params.getFirst("DBSnapshotIdentifier");
+        if (snapshotId == null || snapshotId.isBlank()) {
+            return AwsQueryResponse.error("InvalidParameterValue", "DBSnapshotIdentifier is required.", AwsNamespaces.RDS, 400);
+        }
+        try {
+            io.github.hectorvent.floci.services.rds.model.DbSnapshot snapshot = service.deleteDbSnapshot(snapshotId, region);
+            return Response.ok(AwsQueryResponse.envelope("DeleteDBSnapshot", AwsNamespaces.RDS, dbSnapshotXml(snapshot))).build();
+        } catch (AwsException e) {
+            return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.RDS, e.getHttpStatus());
+        }
+    }
+
+    private Response handleCopyDbSnapshot(MultivaluedMap<String, String> params, String region) {
+        String sourceId = params.getFirst("SourceDBSnapshotIdentifier");
+        String targetId = params.getFirst("TargetDBSnapshotIdentifier");
+        if (sourceId == null || sourceId.isBlank()) {
+            return AwsQueryResponse.error("InvalidParameterValue", "SourceDBSnapshotIdentifier is required.", AwsNamespaces.RDS, 400);
+        }
+        if (targetId == null || targetId.isBlank()) {
+            return AwsQueryResponse.error("InvalidParameterValue", "TargetDBSnapshotIdentifier is required.", AwsNamespaces.RDS, 400);
+        }
+        boolean copyTags = "true".equalsIgnoreCase(params.getFirst("CopyTags"));
+        try {
+            io.github.hectorvent.floci.services.rds.model.DbSnapshot copy = service.copyDbSnapshot(
+                    sourceId, targetId, copyTags, parseTags(params), params.getFirst("OptionGroupName"), region);
+            return Response.ok(AwsQueryResponse.envelope("CopyDBSnapshot", AwsNamespaces.RDS, dbSnapshotXml(copy))).build();
+        } catch (AwsException e) {
+            return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.RDS, e.getHttpStatus());
+        }
+    }
+
+    private Response handleModifyDbSnapshot(MultivaluedMap<String, String> params, String region) {
+        String snapshotId = params.getFirst("DBSnapshotIdentifier");
+        if (snapshotId == null || snapshotId.isBlank()) {
+            return AwsQueryResponse.error("InvalidParameterValue", "DBSnapshotIdentifier is required.", AwsNamespaces.RDS, 400);
+        }
+        try {
+            io.github.hectorvent.floci.services.rds.model.DbSnapshot snapshot = service.modifyDbSnapshot(
+                    snapshotId, params.getFirst("EngineVersion"), params.getFirst("OptionGroupName"), region);
+            return Response.ok(AwsQueryResponse.envelope("ModifyDBSnapshot", AwsNamespaces.RDS, dbSnapshotXml(snapshot))).build();
+        } catch (AwsException e) {
+            return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.RDS, e.getHttpStatus());
+        }
+    }
+
     private Response handleRestoreDbInstanceFromDbSnapshot(MultivaluedMap<String, String> params, String region) {
         String instanceId = params.getFirst("DBInstanceIdentifier");
         String snapshotId = params.getFirst("DBSnapshotIdentifier");
@@ -1938,6 +1987,9 @@ public class RdsQueryHandler {
                 .elem("IAMDatabaseAuthenticationEnabled", s.isIamDatabaseAuthenticationEnabled());
         if (s.getDbiResourceId() != null) xml.elem("DbiResourceId", s.getDbiResourceId());
         if (s.getDbSnapshotArn() != null) xml.elem("DBSnapshotArn", s.getDbSnapshotArn());
+        if (s.getSnapshotType() != null) xml.elem("SnapshotType", s.getSnapshotType());
+        if (s.getSourceDbSnapshotIdentifier() != null) xml.elem("SourceDBSnapshotIdentifier", s.getSourceDbSnapshotIdentifier());
+        if (s.getOptionGroupName() != null) xml.elem("OptionGroupName", s.getOptionGroupName());
         xml.start("TagList");
         writeTags(xml, s.getTags());
         xml.end("TagList");

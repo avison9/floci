@@ -1836,6 +1836,61 @@ class RdsQueryHandlerTest {
     }
 
     @Test
+    void deleteCopyAndModifyDbSnapshot_dispatchAndRenderTheSnapshot() {
+        io.github.hectorvent.floci.services.rds.model.DbSnapshot snapshot = new io.github.hectorvent.floci.services.rds.model.DbSnapshot();
+        snapshot.setDbSnapshotIdentifier("mysnap-copy");
+        snapshot.setDbInstanceIdentifier("mydb");
+        snapshot.setStatus("available");
+        snapshot.setSourceDbSnapshotIdentifier("arn:aws:rds:us-east-1:000000000000:snapshot:mysnap");
+        snapshot.setEngineVersion("16.4");
+        when(service.copyDbSnapshot(eq("mysnap"), eq("mysnap-copy"), eq(true), eq(Map.of("stage", "test")), isNull(), isNull()))
+                .thenReturn(snapshot);
+        MultivaluedMap<String, String> copy = params();
+        copy.add("SourceDBSnapshotIdentifier", "mysnap");
+        copy.add("TargetDBSnapshotIdentifier", "mysnap-copy");
+        copy.add("CopyTags", "true");
+        copy.add("Tags.Tag.1.Key", "stage");
+        copy.add("Tags.Tag.1.Value", "test");
+        Response copied = handler.handle("CopyDBSnapshot", copy);
+        assertEquals(200, copied.getStatus());
+        String copyBody = (String) copied.getEntity();
+        assertTrue(copyBody.contains("<CopyDBSnapshotResult>"));
+        assertTrue(copyBody.contains("<SnapshotType>manual</SnapshotType>"));
+        assertTrue(copyBody.contains("<SourceDBSnapshotIdentifier>arn:aws:rds:us-east-1:000000000000:snapshot:mysnap</SourceDBSnapshotIdentifier>"));
+
+        when(service.modifyDbSnapshot(eq("mysnap-copy"), eq("16.4"), isNull(), isNull())).thenReturn(snapshot);
+        MultivaluedMap<String, String> modify = params();
+        modify.add("DBSnapshotIdentifier", "mysnap-copy");
+        modify.add("EngineVersion", "16.4");
+        Response modified = handler.handle("ModifyDBSnapshot", modify);
+        assertEquals(200, modified.getStatus());
+        assertTrue(((String) modified.getEntity()).contains("<ModifyDBSnapshotResult>"));
+
+        snapshot.setStatus("deleted");
+        when(service.deleteDbSnapshot(eq("mysnap-copy"), isNull())).thenReturn(snapshot);
+        MultivaluedMap<String, String> delete = params();
+        delete.add("DBSnapshotIdentifier", "mysnap-copy");
+        Response deleted = handler.handle("DeleteDBSnapshot", delete);
+        assertEquals(200, deleted.getStatus());
+        String deleteBody = (String) deleted.getEntity();
+        assertTrue(deleteBody.contains("<DeleteDBSnapshotResult>"));
+        assertTrue(deleteBody.contains("<Status>deleted</Status>"));
+    }
+
+    @Test
+    void snapshotLifecycleActions_requireTheirIdentifiers() {
+        assertEquals(400, handler.handle("DeleteDBSnapshot", params()).getStatus());
+        assertEquals(400, handler.handle("ModifyDBSnapshot", params()).getStatus());
+        MultivaluedMap<String, String> onlySource = params();
+        onlySource.add("SourceDBSnapshotIdentifier", "mysnap");
+        Response missingTarget = handler.handle("CopyDBSnapshot", onlySource);
+        assertEquals(400, missingTarget.getStatus());
+        assertTrue(((String) missingTarget.getEntity()).contains("TargetDBSnapshotIdentifier is required."));
+        verify(service, never()).copyDbSnapshot(any(), any(), anyBoolean(), any(), any(), any());
+        verify(service, never()).deleteDbSnapshot(any(), any());
+    }
+
+    @Test
     void describeDbSnapshotAttributes_returnsRestoreAttribute() {
         io.github.hectorvent.floci.services.rds.model.DbSnapshot snapshot = new io.github.hectorvent.floci.services.rds.model.DbSnapshot();
         snapshot.setDbSnapshotIdentifier("mysnap");

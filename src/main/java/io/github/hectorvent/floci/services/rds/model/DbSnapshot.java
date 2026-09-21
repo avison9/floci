@@ -32,6 +32,11 @@ public class DbSnapshot {
     private Map<String, String> tags = new LinkedHashMap<>();
     /** Account IDs authorized to copy/restore this snapshot; the "restore" DBSnapshotAttribute. */
     private List<String> restoreAccountIds = new ArrayList<>();
+    // AWS's SnapshotType: every snapshot Floci takes is a manual one (no automated backups).
+    private String snapshotType = "manual";
+    // Set on a copy: the ARN of the snapshot it was copied from, as the DBSnapshot structure documents.
+    private String sourceDbSnapshotIdentifier;
+    private String optionGroupName;
 
     public DbSnapshot() {}
 
@@ -118,4 +123,15 @@ public class DbSnapshot {
     
     public String getDbInstanceClass() { return dbInstanceClass; }
     public void setDbInstanceClass(String dbInstanceClass) { this.dbInstanceClass = dbInstanceClass; }
+
+    public String getSnapshotType() { return snapshotType; }
+    public void setSnapshotType(String snapshotType) { this.snapshotType = snapshotType; }
+
+    public String getSourceDbSnapshotIdentifier() { return sourceDbSnapshotIdentifier; }
+    public void setSourceDbSnapshotIdentifier(String sourceDbSnapshotIdentifier) {
+        this.sourceDbSnapshotIdentifier = sourceDbSnapshotIdentifier;
+    }
+
+    public String getOptionGroupName() { return optionGroupName; }
+    public void setOptionGroupName(String optionGroupName) { this.optionGroupName = optionGroupName; }
 }

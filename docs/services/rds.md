@@ -56,6 +56,9 @@ RDS Data API (`rds-data`) is documented separately because it uses REST JSON rou
 | `DescribeDBSnapshots` | List DB instance snapshots |
 | `DescribeDBSnapshotAttributes` | Return a snapshot's `restore` attribute (accounts authorized to copy/restore it) |
 | `ModifyDBSnapshotAttribute` | Add or remove accounts authorized to copy/restore a snapshot |
+| `DeleteDBSnapshot` | Delete an available manual snapshot and its data; the response carries `Status` `deleted` |
+| `CopyDBSnapshot` | Copy an available snapshot (by identifier or ARN, same region) to a new manual snapshot with its data; `CopyTags` and `Tags`; the copy reports `SourceDBSnapshotIdentifier` |
+| `ModifyDBSnapshot` | Set `EngineVersion` and `OptionGroupName` on an available manual snapshot |
 | `DescribeDBProxies` | List DB proxies |
 | `CreateDBProxy` | Create a DB proxy |
 | `ModifyDBProxy` | Update mutable DB proxy authentication, logging, timeout, TLS, role, and security-group settings |
@@ -97,9 +100,13 @@ checked against the instance's other window. Modifications apply immediately —
     `CreateDBSnapshot` accepts `Tags`, and `TagResource`/`UntagResource`/`ListTagsForResource`
     work against a snapshot's ARN like they do for other tagged resource types.
     `DescribeDBSnapshotAttributes`/`ModifyDBSnapshotAttribute` are modeled as plain in-memory
-    state (no real cross-account sharing). `DeleteDBSnapshot` is not implemented, so a snapshot
-    persists for the life of the account; Terraform's `aws_db_snapshot` can be created but not
-    destroyed. Snapshots are region-scoped like DB instances and clusters: `DBSnapshotArn` reflects
+    state (no real cross-account sharing). `DeleteDBSnapshot` removes an available snapshot and
+    its data, so Terraform's `aws_db_snapshot` can be destroyed; `CopyDBSnapshot` makes a second
+    manual snapshot with the same data (`CopyTags` carries the tags over) and records the source
+    ARN in `SourceDBSnapshotIdentifier`; `ModifyDBSnapshot` updates `EngineVersion` and
+    `OptionGroupName`. Every snapshot Floci takes is `SnapshotType` `manual`; cross-region copies,
+    KMS re-encryption on copy and `SnapshotQuotaExceeded` are not modeled. Snapshots are
+    region-scoped like DB instances and clusters: `DBSnapshotArn` reflects
     the request's signed region, and a snapshot is only visible to `Describe`/`Tag` calls signed
     for that same region. Aurora cluster snapshots and RDS reserved instances aren't modeled at
     all (`DescribeDBClusterSnapshots` always returns an empty list, and there's no

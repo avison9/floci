@@ -2873,6 +2873,104 @@ class RdsServiceTest {
                 rdsService.listTagsForResource(snapshot.getDbSnapshotArn()));
     }
 
+    private io.github.hectorvent.floci.services.rds.model.DbSnapshot snapshotOfNewPostgresInstance(String snapshotId) {
+        rdsService.createDbInstance("mydb", "postgres", "13",
+                "admin", "password", "dbname", "db.t3.micro",
+                20, false, null, null, null, null, false);
+        when(containerManager.createPostgresSnapshot(any(), eq("admin"))).thenReturn("MOCK_DUMP_DATA");
+        return rdsService.createDbSnapshot(snapshotId, "mydb", Map.of("owner", "platform"));
+    }
+
+    @Test
+    void deleteDbSnapshotRemovesTheSnapshotAndItsDataAndAnswersDeleted() {
+        snapshotOfNewPostgresInstance("mysnap");
+
+        io.github.hectorvent.floci.services.rds.model.DbSnapshot deleted = rdsService.deleteDbSnapshot("mysnap");
+
+        assertEquals("mysnap", deleted.getDbSnapshotIdentifier());
+        assertEquals("deleted", deleted.getStatus());
+        AwsException gone = assertThrows(AwsException.class, () -> rdsService.describeDbSnapshots("mysnap", null));
+        assertEquals("DBSnapshotNotFound", gone.getErrorCode());
+        assertEquals("DBSnapshotNotFound",
+                assertThrows(AwsException.class, () -> rdsService.deleteDbSnapshot("mysnap")).getErrorCode());
+        // The data went with it: a restore from the deleted snapshot has nothing to restore.
+        assertEquals("DBSnapshotNotFound", assertThrows(AwsException.class, () -> rdsService.restoreDbInstanceFromDbSnapshot(
+                "restored-db", "mysnap", "db.t3.large", "us-east-1a", false, null, null, Map.of())).getErrorCode());
+    }
+
+    @Test
+    void deleteCopyAndModifyRequireAnAvailableSnapshot() {
+        io.github.hectorvent.floci.services.rds.model.DbSnapshot snapshot = snapshotOfNewPostgresInstance("mysnap");
+        snapshot.setStatus("creating");
+
+        assertEquals("InvalidDBSnapshotState",
+                assertThrows(AwsException.class, () -> rdsService.deleteDbSnapshot("mysnap")).getErrorCode());
+        assertEquals("InvalidDBSnapshotState",
+                assertThrows(AwsException.class,
+                        () -> rdsService.copyDbSnapshot("mysnap", "copy", false, null, null)).getErrorCode());
+        assertEquals("InvalidDBSnapshotState",
+                assertThrows(AwsException.class,
+                        () -> rdsService.modifyDbSnapshot("mysnap", "14", null)).getErrorCode());
+    }
+
+    @Test
+    void copyDbSnapshotCarriesTheDataTheSourceReferenceAndOptionallyTheTags() {
+        io.github.hectorvent.floci.services.rds.model.DbSnapshot source = snapshotOfNewPostgresInstance("mysnap");
+
+        io.github.hectorvent.floci.services.rds.model.DbSnapshot copy =
+                rdsService.copyDbSnapshot("mysnap", "mysnap-copy", true, Map.of("stage", "test"), null);
+
+        assertEquals("mysnap-copy", copy.getDbSnapshotIdentifier());
+        assertEquals("available", copy.getStatus());
+        assertEquals("manual", copy.getSnapshotType());
+        assertEquals("mydb", copy.getDbInstanceIdentifier());
+        assertEquals(source.getDbSnapshotArn(), copy.getSourceDbSnapshotIdentifier());
+        assertEquals("arn:aws:rds:us-east-1:123456789012:snapshot:mysnap-copy", copy.getDbSnapshotArn());
+        assertEquals(Map.of("owner", "platform", "stage", "test"), copy.getTags());
+        assertEquals(2, rdsService.describeDbSnapshots(null, "mydb").size());
+        // The copy restores the source's data: the copied dump reaches the new container.
+        rdsService.restoreDbInstanceFromDbSnapshot("from-copy", "mysnap-copy", "db.t3.large", "us-east-1a", false, null, null, Map.of());
+        verify(containerManager).restorePostgresSnapshot(any(), eq("admin"), eq("MOCK_DUMP_DATA"));
+        // Deleting the source leaves the copy and its data intact.
+        rdsService.deleteDbSnapshot("mysnap");
+        assertEquals(1, rdsService.describeDbSnapshots(null, "mydb").size());
+        rdsService.restoreDbInstanceFromDbSnapshot("from-copy-2", "mysnap-copy", "db.t3.large", "us-east-1a", false, null, null, Map.of());
+        verify(containerManager, times(2)).restorePostgresSnapshot(any(), eq("admin"), eq("MOCK_DUMP_DATA"));
+    }
+
+    @Test
+    void copyDbSnapshotWithoutCopyTagsKeepsOnlyTheGivenTagsAndAcceptsAnArnSource() {
+        io.github.hectorvent.floci.services.rds.model.DbSnapshot source = snapshotOfNewPostgresInstance("mysnap");
+
+        io.github.hectorvent.floci.services.rds.model.DbSnapshot copy =
+                rdsService.copyDbSnapshot(source.getDbSnapshotArn(), "mysnap-copy", false, Map.of("stage", "test"), "og-1");
+        assertEquals(Map.of("stage", "test"), copy.getTags());
+        assertEquals("og-1", copy.getOptionGroupName());
+
+        assertEquals("DBSnapshotAlreadyExists",
+                assertThrows(AwsException.class,
+                        () -> rdsService.copyDbSnapshot("mysnap", "mysnap-copy", false, null, null)).getErrorCode());
+        assertEquals("DBSnapshotNotFound",
+                assertThrows(AwsException.class,
+                        () -> rdsService.copyDbSnapshot("absent", "another", false, null, null)).getErrorCode());
+        assertEquals("InvalidParameterValue",
+                assertThrows(AwsException.class, () -> rdsService.copyDbSnapshot(
+                        "arn:aws:rds:eu-west-1:123456789012:snapshot:mysnap", "another", false, null, null)).getErrorCode());
+    }
+
+    @Test
+    void modifyDbSnapshotUpdatesEngineVersionAndOptionGroup() {
+        snapshotOfNewPostgresInstance("mysnap");
+
+        io.github.hectorvent.floci.services.rds.model.DbSnapshot modified = rdsService.modifyDbSnapshot("mysnap", "14", "og-2");
+
+        assertEquals("14", modified.getEngineVersion());
+        assertEquals("og-2", modified.getOptionGroupName());
+        assertEquals("14", rdsService.describeDbSnapshots("mysnap", null).iterator().next().getEngineVersion());
+        assertEquals("DBSnapshotNotFound",
+                assertThrows(AwsException.class, () -> rdsService.modifyDbSnapshot("absent", "14", null)).getErrorCode());
+    }
+
     @Test
     void dbSnapshotTagsRoundTripAndMutateByArn() {
         rdsService.createDbInstance("mydb", "postgres", "13",
