@@ -14,9 +14,12 @@ import software.amazon.awssdk.services.rds.model.ConnectionPoolConfigurationInfo
 import software.amazon.awssdk.services.rds.model.CreateDbProxyResponse;
 import software.amazon.awssdk.services.rds.model.CreateDbSubnetGroupResponse;
 import software.amazon.awssdk.services.rds.model.CreateOptionGroupResponse;
+import software.amazon.awssdk.services.rds.model.DBCluster;
+import software.amazon.awssdk.services.rds.model.DBClusterSnapshot;
 import software.amazon.awssdk.services.rds.model.DBInstance;
 import software.amazon.awssdk.services.rds.model.DBProxyTarget;
 import software.amazon.awssdk.services.rds.model.DBSnapshot;
+import software.amazon.awssdk.services.rds.model.DbClusterSnapshotNotFoundException;
 import software.amazon.awssdk.services.rds.model.DbSnapshotAlreadyExistsException;
 import software.amazon.awssdk.services.rds.model.DbSnapshotNotFoundException;
 import software.amazon.awssdk.services.rds.model.InvalidDbInstanceStateException;
@@ -477,6 +480,80 @@ class RdsControlPlaneTest {
                 rds.deleteDBSnapshot(b -> b.dbSnapshotIdentifier(copyName));
             } catch (Exception ignored) {}
             deleteDbInstance(rds, instanceName);
+        }
+    }
+
+    @Test
+    void sdkCreatesCopiesRestoresAndDeletesClusterSnapshots() {
+        String clusterName = TestFixtures.uniqueName("rds-csnap-cluster");
+        String snapshotName = TestFixtures.uniqueName("rds-csnap");
+        String copyName = snapshotName + "-copy";
+        String restoredName = clusterName + "-restored";
+        try {
+            rds.createDBCluster(b -> b
+                    .dbClusterIdentifier(clusterName)
+                    .engine("aurora-postgresql")
+                    .engineVersion("16.3")
+                    .masterUsername("admin")
+                    .masterUserPassword("csnap-secret")
+                    .databaseName("app"));
+
+            DBClusterSnapshot snapshot = rds.createDBClusterSnapshot(b -> b
+                    .dbClusterSnapshotIdentifier(snapshotName)
+                    .dbClusterIdentifier(clusterName)
+                    .tags(Tag.builder().key("owner").value("platform").build()))
+                    .dbClusterSnapshot();
+            assertThat(snapshot.status()).isEqualTo("available");
+            assertThat(snapshot.snapshotType()).isEqualTo("manual");
+            assertThat(snapshot.percentProgress()).isEqualTo(100);
+            assertThat(snapshot.engine()).isEqualTo("aurora-postgresql");
+            assertThat(snapshot.dbClusterSnapshotArn()).contains(":cluster-snapshot:" + snapshotName);
+
+            assertThat(rds.describeDBClusterSnapshots(b -> b.dbClusterIdentifier(clusterName)).dbClusterSnapshots())
+                    .extracting(DBClusterSnapshot::dbClusterSnapshotIdentifier)
+                    .containsExactly(snapshotName);
+
+            DBClusterSnapshot copy = rds.copyDBClusterSnapshot(b -> b
+                    .sourceDBClusterSnapshotIdentifier(snapshot.dbClusterSnapshotArn())
+                    .targetDBClusterSnapshotIdentifier(copyName)
+                    .copyTags(true))
+                    .dbClusterSnapshot();
+            assertThat(copy.sourceDBClusterSnapshotArn()).isEqualTo(snapshot.dbClusterSnapshotArn());
+            assertThat(copy.tagList()).extracting(Tag::key).containsExactly("owner");
+
+            rds.modifyDBClusterSnapshotAttribute(b -> b
+                    .dbClusterSnapshotIdentifier(copyName)
+                    .attributeName("restore")
+                    .valuesToAdd("all"));
+            assertThat(rds.describeDBClusterSnapshotAttributes(b -> b.dbClusterSnapshotIdentifier(copyName))
+                    .dbClusterSnapshotAttributesResult().dbClusterSnapshotAttributes())
+                    .singleElement()
+                    .satisfies(attribute -> assertThat(attribute.attributeValues()).containsExactly("all"));
+
+            assertThat(rds.deleteDBClusterSnapshot(b -> b.dbClusterSnapshotIdentifier(snapshotName))
+                    .dbClusterSnapshot().status()).isEqualTo("deleted");
+            assertThatThrownBy(() -> rds.describeDBClusterSnapshots(b -> b.dbClusterSnapshotIdentifier(snapshotName)))
+                    .isInstanceOf(DbClusterSnapshotNotFoundException.class);
+
+            DBCluster restored = rds.restoreDBClusterFromSnapshot(b -> b
+                    .dbClusterIdentifier(restoredName)
+                    .snapshotIdentifier(copyName)
+                    .engine("aurora-postgresql"))
+                    .dbCluster();
+            assertThat(restored.dbClusterIdentifier()).isEqualTo(restoredName);
+            assertThat(restored.masterUsername()).isEqualTo("admin");
+            assertThat(restored.databaseName()).isEqualTo("app");
+        } finally {
+            for (String name : List.of(snapshotName, copyName)) {
+                try {
+                    rds.deleteDBClusterSnapshot(b -> b.dbClusterSnapshotIdentifier(name));
+                } catch (Exception ignored) {}
+            }
+            for (String name : List.of(restoredName, clusterName)) {
+                try {
+                    rds.deleteDBCluster(b -> b.dbClusterIdentifier(name).skipFinalSnapshot(true));
+                } catch (Exception ignored) {}
+            }
         }
     }
 

@@ -28,6 +28,7 @@ import io.github.hectorvent.floci.services.rds.container.RdsContainerManager;
 import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
 import io.github.hectorvent.floci.services.rds.model.DbCluster;
 import io.github.hectorvent.floci.services.rds.model.DbClusterParameterGroup;
+import io.github.hectorvent.floci.services.rds.model.DbClusterSnapshot;
 import io.github.hectorvent.floci.services.rds.model.DbEndpoint;
 import io.github.hectorvent.floci.services.rds.model.DbInstance;
 import io.github.hectorvent.floci.services.kms.KmsService;
@@ -155,6 +156,7 @@ public class RdsService implements Resettable, ResourceProvider {
     private final StorageBackend<String, DbProxy> proxies;
     private final StorageBackend<String, DbProxyTargetGroup> proxyTargetGroups;
     private final StorageBackend<String, DbSnapshot> snapshots;
+    private final StorageBackend<String, DbClusterSnapshot> clusterSnapshots;
     private final StorageBackend<String, GlobalCluster> globalClusters;
     private final StorageBackend<String, String> snapshotData;
     private StorageBackend<String, RdsEvent> events = new InMemoryStorage<>();
@@ -239,6 +241,8 @@ public class RdsService implements Resettable, ResourceProvider {
                 new TypeReference<Map<String, GlobalCluster>>() {});
         this.snapshots = storageFactory.create("rds", "rds-snapshots.json",
                 new TypeReference<Map<String, DbSnapshot>>() {});
+        this.clusterSnapshots = storageFactory.create("rds", "rds-cluster-snapshots.json",
+                new TypeReference<Map<String, DbClusterSnapshot>>() {});
         this.snapshotData = storageFactory.create("rds", "rds-snapshot-data.json",
                 new TypeReference<Map<String, String>>() {});
         this.events = storageFactory.create("rds", "rds-events.json",
@@ -376,6 +380,7 @@ public class RdsService implements Resettable, ResourceProvider {
         this.taggingService = taggingService;
         this.globalClusters = new io.github.hectorvent.floci.core.storage.InMemoryStorage<>();
         this.snapshots = new io.github.hectorvent.floci.core.storage.InMemoryStorage<>();
+        this.clusterSnapshots = new io.github.hectorvent.floci.core.storage.InMemoryStorage<>();
         this.snapshotData = new io.github.hectorvent.floci.core.storage.InMemoryStorage<>();
     }
 
@@ -1470,6 +1475,348 @@ public class RdsService implements Resettable, ResourceProvider {
         return snapshot;
     }
 
+    // ── DB cluster snapshots ───────────────────────────────────────────────────
+
+    /**
+     * Takes a manual snapshot of an available cluster: its description plus a dump of its
+     * database, so RestoreDBClusterFromSnapshot can bring the data back into a new cluster.
+     */
+    public DbClusterSnapshot createDbClusterSnapshot(String snapshotId, String clusterId, Map<String, String> tags) {
+        return createDbClusterSnapshot(snapshotId, clusterId, tags, regionResolver.getDefaultRegion());
+    }
+
+    public synchronized DbClusterSnapshot createDbClusterSnapshot(String snapshotId, String clusterId,
+                                                                  Map<String, String> tags, String region) {
+        String effectiveRegion = effectiveRegion(region);
+        String accountId = currentAccountId();
+        if (snapshotId == null || snapshotId.isBlank()) {
+            throw new AwsException("InvalidParameterValue", "DBClusterSnapshotIdentifier is required.", 400);
+        }
+        if (findClusterSnapshotForScope(accountId, effectiveRegion, snapshotId) != null) {
+            throw new AwsException("DBClusterSnapshotAlreadyExistsFault",
+                    "DB cluster snapshot " + snapshotId + " already exists.", 400);
+        }
+        DbCluster cluster = getDbCluster(clusterId, effectiveRegion);
+        if (cluster.getStatus() != null && cluster.getStatus() != DbInstanceStatus.AVAILABLE) {
+            throw new AwsException("InvalidDBClusterStateFault",
+                    "DB cluster " + clusterId + " is not available.", 400);
+        }
+        if (cluster.getEngine() != DatabaseEngine.POSTGRES) {
+            throw new AwsException("InvalidDBClusterStateFault",
+                    "Operation CreateDBClusterSnapshot is not supported for engine " + cluster.getEngine() + ".", 400);
+        }
+
+        DbClusterSnapshot snapshot = clusterSnapshotOf(cluster, snapshotId, effectiveRegion);
+        snapshot.setTags(tags != null ? new LinkedHashMap<>(tags) : new LinkedHashMap<>());
+
+        String sqlDump = "";
+        if (!config.services().rds().mock()) {
+            try {
+                sqlDump = containerManager.createPostgresSnapshot(cluster.getContainerId(), cluster.getMasterUsername());
+            } catch (Exception e) {
+                LOG.warnv(e, "Failed to create snapshot {0} of DB cluster {1}", snapshotId, clusterId);
+                throw new AwsException("InvalidDBClusterStateFault", "Failed to create snapshot: " + e.getMessage(), 400);
+            }
+        }
+        snapshotData.put(clusterSnapshotDataKey(effectiveRegion, snapshotId), sqlDump);
+        putClusterSnapshotForScope(accountId, effectiveRegion, snapshotId, snapshot);
+        LOG.infov("Created DB cluster snapshot {0} of cluster {1}", snapshotId, clusterId);
+        return snapshot;
+    }
+
+    public Collection<DbClusterSnapshot> describeDbClusterSnapshots(String snapshotId, String clusterId, String snapshotType) {
+        return describeDbClusterSnapshots(snapshotId, clusterId, snapshotType, regionResolver.getDefaultRegion());
+    }
+
+    public Collection<DbClusterSnapshot> describeDbClusterSnapshots(String snapshotId, String clusterId,
+                                                                    String snapshotType, String region) {
+        String effectiveRegion = effectiveRegion(region);
+        String accountId = currentAccountId();
+        List<DbClusterSnapshot> matching;
+        if (snapshotId != null && !snapshotId.isBlank()) {
+            matching = List.of(requireClusterSnapshot(accountId, effectiveRegion, snapshotId));
+        } else {
+            matching = clusterSnapshots.scan(k -> true).stream()
+                    .filter(s -> hasRdsResourceIdentity(s.getDbClusterSnapshotArn(), accountId, effectiveRegion,
+                            "cluster-snapshot", s.getDbClusterSnapshotIdentifier()))
+                    .toList();
+        }
+        return matching.stream()
+                .filter(s -> clusterId == null || clusterId.isBlank() || clusterId.equals(s.getDbClusterIdentifier()))
+                .filter(s -> snapshotType == null || snapshotType.isBlank() || snapshotType.equals(s.getSnapshotType()))
+                .toList();
+    }
+
+    /** Deletes an available cluster snapshot and its data, answering with the snapshot at status "deleted". */
+    public DbClusterSnapshot deleteDbClusterSnapshot(String snapshotId) {
+        return deleteDbClusterSnapshot(snapshotId, regionResolver.getDefaultRegion());
+    }
+
+    public synchronized DbClusterSnapshot deleteDbClusterSnapshot(String snapshotId, String region) {
+        String effectiveRegion = effectiveRegion(region);
+        String accountId = currentAccountId();
+        DbClusterSnapshot snapshot = requireClusterSnapshot(accountId, effectiveRegion, snapshotId);
+        requireClusterSnapshotAvailable(snapshot, "delete");
+        snapshotData.delete(clusterSnapshotDataKey(effectiveRegion, snapshotId));
+        deleteClusterSnapshotForScope(accountId, effectiveRegion, snapshotId);
+        snapshot.setStatus("deleted");
+        LOG.infov("Deleted DB cluster snapshot {0}", snapshotId);
+        return snapshot;
+    }
+
+    /** Copies an available cluster snapshot to a new manual one, recording the source ARN. */
+    public DbClusterSnapshot copyDbClusterSnapshot(String sourceSnapshotId, String targetSnapshotId,
+                                                   boolean copyTags, Map<String, String> tags) {
+        return copyDbClusterSnapshot(sourceSnapshotId, targetSnapshotId, copyTags, tags, regionResolver.getDefaultRegion());
+    }
+
+    public synchronized DbClusterSnapshot copyDbClusterSnapshot(String sourceSnapshotId, String targetSnapshotId,
+                                                                boolean copyTags, Map<String, String> tags, String region) {
+        String effectiveRegion = effectiveRegion(region);
+        String accountId = currentAccountId();
+        String sourceId = clusterSnapshotIdentifierFromArnOrName(sourceSnapshotId, effectiveRegion);
+        DbClusterSnapshot source = requireClusterSnapshot(accountId, effectiveRegion, sourceId);
+        requireClusterSnapshotAvailable(source, "copy");
+        if (targetSnapshotId == null || targetSnapshotId.isBlank()) {
+            throw new AwsException("InvalidParameterValue", "TargetDBClusterSnapshotIdentifier is required.", 400);
+        }
+        if (findClusterSnapshotForScope(accountId, effectiveRegion, targetSnapshotId) != null) {
+            throw new AwsException("DBClusterSnapshotAlreadyExistsFault",
+                    "DB cluster snapshot " + targetSnapshotId + " already exists.", 400);
+        }
+        DbClusterSnapshot copy = copyOfClusterSnapshot(source, targetSnapshotId, effectiveRegion);
+        copy.setSourceDbClusterSnapshotArn(source.getDbClusterSnapshotArn());
+        Map<String, String> copiedTags = new LinkedHashMap<>();
+        if (copyTags) {
+            copiedTags.putAll(source.getTags());
+        }
+        if (tags != null) {
+            copiedTags.putAll(tags);
+        }
+        copy.setTags(copiedTags);
+        String sqlDump = snapshotData.get(clusterSnapshotDataKey(effectiveRegion, sourceId)).orElse("");
+        snapshotData.put(clusterSnapshotDataKey(effectiveRegion, targetSnapshotId), sqlDump);
+        putClusterSnapshotForScope(accountId, effectiveRegion, targetSnapshotId, copy);
+        LOG.infov("Copied DB cluster snapshot {0} to {1}", sourceId, targetSnapshotId);
+        return copy;
+    }
+
+    public DbClusterSnapshot describeDbClusterSnapshotAttributes(String snapshotId, String region) {
+        return requireClusterSnapshot(currentAccountId(), effectiveRegion(region), snapshotId);
+    }
+
+    /** The "restore" attribute, as ModifyDBSnapshotAttribute keeps it for instance snapshots. */
+    public synchronized DbClusterSnapshot modifyDbClusterSnapshotAttribute(String snapshotId, String attributeName,
+                                                                           List<String> valuesToAdd,
+                                                                           List<String> valuesToRemove, String region) {
+        String effectiveRegion = effectiveRegion(region);
+        String accountId = currentAccountId();
+        DbClusterSnapshot snapshot = requireClusterSnapshot(accountId, effectiveRegion, snapshotId);
+        if (!"restore".equals(attributeName)) {
+            throw new AwsException("InvalidParameterValue", "AttributeName must be restore.", 400);
+        }
+        requireClusterSnapshotAvailable(snapshot, "share");
+        List<String> updated = new ArrayList<>(snapshot.getRestoreAccountIds());
+        if (valuesToAdd != null) {
+            valuesToAdd.stream().filter(v -> !updated.contains(v)).forEach(updated::add);
+        }
+        if (valuesToRemove != null) {
+            updated.removeAll(valuesToRemove);
+        }
+        snapshot.setRestoreAccountIds(updated);
+        putClusterSnapshotForScope(accountId, effectiveRegion, snapshotId, snapshot);
+        return snapshot;
+    }
+
+    /**
+     * Creates a new cluster from a cluster snapshot: the snapshot's engine, credentials and
+     * database, the request's overrides where AWS allows them, and then the snapshot's data
+     * restored into the new cluster's database.
+     */
+    public DbCluster restoreDbClusterFromSnapshot(String clusterId, String snapshotId, String engine,
+                                                  String engineVersion, Integer port, String databaseName,
+                                                  String dbSubnetGroupName, String parameterGroupName,
+                                                  String availabilityZone, Boolean iamEnabled, String engineMode,
+                                                  Map<String, String> tags, String region) {
+        String effectiveRegion = effectiveRegion(region);
+        String accountId = currentAccountId();
+        DbClusterSnapshot snapshot = requireClusterSnapshot(accountId, effectiveRegion, snapshotId);
+        requireClusterSnapshotAvailable(snapshot, "restore from");
+        if (engine == null || engine.isBlank()) {
+            throw new AwsException("InvalidParameterValue", "Engine is required.", 400);
+        }
+        if (resolveEngine(engine) != snapshot.getEngine()) {
+            throw new AwsException("InvalidParameterValue",
+                    "The snapshot's engine is " + snapshot.getEngineIdentifier() + "; cannot restore it as " + engine + ".", 400);
+        }
+        String sqlDump = snapshotData.get(clusterSnapshotDataKey(effectiveRegion, snapshotId))
+                .orElseThrow(() -> new AwsException("DBClusterSnapshotNotFoundFault",
+                        "DB cluster snapshot data for " + snapshotId + " not found.", 404));
+
+        DbCluster cluster = createDbCluster(clusterId, engine,
+                engineVersion != null && !engineVersion.isBlank() ? engineVersion : snapshot.getEngineVersion(),
+                snapshot.getMasterUsername(), snapshot.getMasterPassword(),
+                databaseName != null && !databaseName.isBlank() ? databaseName : snapshot.getDatabaseName(),
+                iamEnabled != null ? iamEnabled : snapshot.isIamDatabaseAuthenticationEnabled(),
+                parameterGroupName, dbSubnetGroupName, availabilityZone, false, effectiveRegion,
+                null, null, null, false, null,
+                engineMode != null && !engineMode.isBlank() ? engineMode : snapshot.getEngineMode(),
+                snapshot.isStorageEncrypted());
+        if (tags != null && !tags.isEmpty()) {
+            cluster.getTags().putAll(tags);
+            putClusterForScope(accountId, effectiveRegion, clusterId, cluster);
+        }
+        if (!config.services().rds().mock()) {
+            try {
+                containerManager.restorePostgresSnapshot(cluster.getContainerId(), cluster.getMasterUsername(), sqlDump);
+            } catch (Exception e) {
+                try {
+                    deleteDbCluster(clusterId, effectiveRegion);
+                } catch (Exception cleanupError) {
+                    e.addSuppressed(cleanupError);
+                }
+                AwsException awsEx = new AwsException("InvalidDBClusterSnapshotStateFault",
+                        "Failed to restore snapshot: " + e.getMessage(), 400);
+                awsEx.initCause(e);
+                throw awsEx;
+            }
+        }
+        return cluster;
+    }
+
+    private DbClusterSnapshot clusterSnapshotOf(DbCluster cluster, String snapshotId, String region) {
+        DbClusterSnapshot snapshot = new DbClusterSnapshot();
+        snapshot.setDbClusterSnapshotIdentifier(snapshotId);
+        snapshot.setDbClusterSnapshotArn(regionResolver.buildArn("rds", region, "cluster-snapshot:" + snapshotId));
+        snapshot.setDbClusterIdentifier(cluster.getDbClusterIdentifier());
+        snapshot.setSnapshotCreateTime(Instant.now());
+        snapshot.setClusterCreateTime(cluster.getCreatedAt());
+        snapshot.setEngine(cluster.getEngine());
+        snapshot.setEngineIdentifier(cluster.getEngineIdentifier() != null
+                ? cluster.getEngineIdentifier() : cluster.getEngine().name().toLowerCase(Locale.ROOT));
+        snapshot.setEngineVersion(cluster.getEngineVersion());
+        snapshot.setEngineMode(cluster.getEngineMode());
+        // Aurora reports 1 GiB for a cluster snapshot: storage is not provisioned per cluster.
+        snapshot.setAllocatedStorage(1);
+        snapshot.setStatus("available");
+        snapshot.setPercentProgress(100);
+        snapshot.setPort(cluster.getEndpoint() != null ? cluster.getEndpoint().port() : cluster.getProxyPort());
+        snapshot.setVpcId(cluster.getVpcId());
+        if (cluster.getAvailabilityZone() != null) {
+            snapshot.setAvailabilityZones(new ArrayList<>(List.of(cluster.getAvailabilityZone())));
+        }
+        snapshot.setMasterUsername(cluster.getMasterUsername());
+        snapshot.setMasterPassword(cluster.getMasterPassword());
+        snapshot.setDatabaseName(cluster.getDatabaseName());
+        snapshot.setLicenseModel("postgresql-license");
+        snapshot.setStorageEncrypted(cluster.isStorageEncrypted());
+        snapshot.setIamDatabaseAuthenticationEnabled(cluster.isIamDatabaseAuthenticationEnabled());
+        snapshot.setDbClusterResourceId(cluster.getDbClusterResourceId());
+        return snapshot;
+    }
+
+    private DbClusterSnapshot copyOfClusterSnapshot(DbClusterSnapshot source, String targetId, String region) {
+        DbClusterSnapshot copy = new DbClusterSnapshot();
+        copy.setDbClusterSnapshotIdentifier(targetId);
+        copy.setDbClusterSnapshotArn(regionResolver.buildArn("rds", region, "cluster-snapshot:" + targetId));
+        copy.setDbClusterIdentifier(source.getDbClusterIdentifier());
+        copy.setSnapshotCreateTime(Instant.now());
+        copy.setClusterCreateTime(source.getClusterCreateTime());
+        copy.setEngine(source.getEngine());
+        copy.setEngineIdentifier(source.getEngineIdentifier());
+        copy.setEngineVersion(source.getEngineVersion());
+        copy.setEngineMode(source.getEngineMode());
+        copy.setAllocatedStorage(source.getAllocatedStorage());
+        copy.setStatus("available");
+        copy.setPercentProgress(100);
+        copy.setPort(source.getPort());
+        copy.setVpcId(source.getVpcId());
+        copy.setAvailabilityZones(new ArrayList<>(source.getAvailabilityZones()));
+        copy.setMasterUsername(source.getMasterUsername());
+        copy.setMasterPassword(source.getMasterPassword());
+        copy.setDatabaseName(source.getDatabaseName());
+        copy.setLicenseModel(source.getLicenseModel());
+        copy.setStorageEncrypted(source.isStorageEncrypted());
+        copy.setKmsKeyId(source.getKmsKeyId());
+        copy.setIamDatabaseAuthenticationEnabled(source.isIamDatabaseAuthenticationEnabled());
+        copy.setDbClusterResourceId(source.getDbClusterResourceId());
+        return copy;
+    }
+
+    private DbClusterSnapshot requireClusterSnapshot(String accountId, String region, String snapshotId) {
+        if (snapshotId == null || snapshotId.isBlank()) {
+            throw new AwsException("InvalidParameterValue", "DBClusterSnapshotIdentifier is required.", 400);
+        }
+        return Optional.ofNullable(findClusterSnapshotForScope(accountId, region, snapshotId))
+                .orElseThrow(() -> new AwsException("DBClusterSnapshotNotFoundFault",
+                        "DBClusterSnapshot " + snapshotId + " not found.", 404));
+    }
+
+    private static void requireClusterSnapshotAvailable(DbClusterSnapshot snapshot, String operation) {
+        if (!"available".equals(snapshot.getStatus())) {
+            throw new AwsException("InvalidDBClusterSnapshotStateFault",
+                    "Cannot " + operation + " DB cluster snapshot " + snapshot.getDbClusterSnapshotIdentifier()
+                            + " while its status is " + snapshot.getStatus() + ".", 400);
+        }
+    }
+
+    private String clusterSnapshotIdentifierFromArnOrName(String source, String region) {
+        if (source == null || source.isBlank()) {
+            throw new AwsException("InvalidParameterValue", "SourceDBClusterSnapshotIdentifier is required.", 400);
+        }
+        if (!source.startsWith("arn:")) {
+            return source;
+        }
+        AwsArnUtils.Arn arn;
+        try {
+            arn = AwsArnUtils.parse(source);
+        } catch (IllegalArgumentException malformed) {
+            throw new AwsException("InvalidParameterValue", "Invalid snapshot identifier: " + source, 400);
+        }
+        String resource = arn.resource();
+        if (!"rds".equals(arn.service()) || !resource.startsWith("cluster-snapshot:")) {
+            throw new AwsException("InvalidParameterValue", "Invalid snapshot identifier: " + source, 400);
+        }
+        if (!region.equals(arn.region())) {
+            throw new AwsException("InvalidParameterValue",
+                    "Cross-region snapshot copy is not supported: " + source, 400);
+        }
+        return resource.substring("cluster-snapshot:".length());
+    }
+
+    /** Cluster snapshot dumps share the snapshot data store with instance snapshots under their own prefix. */
+    private String clusterSnapshotDataKey(String region, String snapshotId) {
+        return dbResourceKey(region, "cluster-snapshot:" + snapshotId);
+    }
+
+    private synchronized DbClusterSnapshot findClusterSnapshotForScope(String accountId, String region, String snapshotId) {
+        String key = dbResourceKey(region, snapshotId);
+        java.util.function.Predicate<DbClusterSnapshot> owner = snapshot -> hasRdsResourceIdentity(
+                snapshot.getDbClusterSnapshotArn(), accountId, region, "cluster-snapshot", snapshotId);
+        if (clusterSnapshots instanceof AccountAwareStorageBackend<DbClusterSnapshot> aware) {
+            return aware.getForAccount(accountId, key).filter(owner).orElse(null);
+        }
+        return clusterSnapshots.get(key).filter(owner).orElse(null);
+    }
+
+    private void putClusterSnapshotForScope(String accountId, String region, String snapshotId, DbClusterSnapshot snapshot) {
+        String key = dbResourceKey(region, snapshotId);
+        if (clusterSnapshots instanceof AccountAwareStorageBackend<DbClusterSnapshot> aware) {
+            aware.putForAccount(accountId, key, snapshot);
+        } else {
+            clusterSnapshots.put(key, snapshot);
+        }
+    }
+
+    private void deleteClusterSnapshotForScope(String accountId, String region, String snapshotId) {
+        String key = dbResourceKey(region, snapshotId);
+        if (clusterSnapshots instanceof AccountAwareStorageBackend<DbClusterSnapshot> aware) {
+            aware.deleteForAccount(accountId, key);
+        } else {
+            clusterSnapshots.delete(key);
+        }
+    }
+
     public Map<String, String> listTagsForResource(String resourceName) {
         return listTagsForResource(resourceName, resourceRegionOrDefault(resourceName));
     }
@@ -1573,6 +1920,13 @@ public class RdsService implements Resettable, ResourceProvider {
                     group.setTags(updated);
                     putSubnetGroupForScope(
                             currentAccountId(), effectiveRegion, resourceId, group);
+                });
+            }
+            case "cluster-snapshot" -> {
+                DbClusterSnapshot snapshot = requireClusterSnapshot(currentAccountId(), effectiveRegion, resourceId);
+                yield new TagHandle(snapshot.getTags(), updated -> {
+                    snapshot.setTags(updated);
+                    putClusterSnapshotForScope(currentAccountId(), effectiveRegion, resourceId, snapshot);
                 });
             }
             case "snapshot" -> {

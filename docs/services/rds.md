@@ -73,7 +73,13 @@ RDS Data API (`rds-data`) is documented separately because it uses REST JSON rou
 | `DescribeDBProxyTargetGroups` | List a proxy's target groups |
 | `ModifyDBProxyTargetGroup` | Update target-group connection-pool configuration |
 | `DescribeDBProxyTargets` | List a proxy target group's registered targets |
-| `DescribeDBClusterSnapshots` | Return an empty cluster-snapshot list (snapshots are not modeled) |
+| `DescribeDBClusterSnapshots` | List cluster snapshots, filtered by `DBClusterSnapshotIdentifier`, `DBClusterIdentifier` and `SnapshotType` |
+| `CreateDBClusterSnapshot` | Take a manual snapshot of an available cluster, with its data and `Tags` |
+| `DeleteDBClusterSnapshot` | Delete an available cluster snapshot and its data; the response carries `Status` `deleted` |
+| `CopyDBClusterSnapshot` | Copy an available cluster snapshot (by identifier or same-region ARN) to a new manual one with its data; `CopyTags` and `Tags`; the copy reports `SourceDBClusterSnapshotArn` |
+| `RestoreDBClusterFromSnapshot` | Create a cluster from a cluster snapshot's settings and data; `Engine` must match the snapshot's |
+| `DescribeDBClusterSnapshotAttributes` | Return the `restore` attribute of a cluster snapshot |
+| `ModifyDBClusterSnapshotAttribute` | Add or remove `restore` values (account ids or `all`) on a cluster snapshot |
 | `DescribeGlobalClusters` | List the account's global clusters with their primary and secondary members; see [Global clusters](#global-clusters) |
 | `CreateGlobalCluster` | Create an Aurora global database, empty or with an existing Aurora cluster as its primary |
 | `ModifyGlobalCluster` | Rename a global cluster, set deletion protection, or upgrade its engine version (members follow) |
@@ -123,9 +129,11 @@ checked against the instance's other window. Modifications apply immediately —
     identifier or ARN, and modified. Copies retain the source data and can copy source tags or add
     request tags. Snapshots are region-scoped like DB instances and clusters: `DBSnapshotArn` reflects
     the request's signed region, and a snapshot is only visible to `Describe`/`Tag` calls signed
-    for that same region. Aurora cluster snapshots and RDS reserved instances aren't modeled at
-    all (`DescribeDBClusterSnapshots` always returns an empty list, and there's no
-    reserved-instance API), so tagging doesn't apply to either.
+    for that same region. Cluster snapshots follow the same lifecycle: `CreateDBClusterSnapshot`
+    dumps the cluster's database, `RestoreDBClusterFromSnapshot` loads it into a new cluster, and
+    `Copy`, `Delete` and the `restore` attribute behave as they do for instance snapshots, under
+    `arn:aws:rds:<region>:<account>:cluster-snapshot:<name>`. RDS reserved instances aren't
+    modeled (there's no reserved-instance API), so tagging doesn't apply to them.
 
 ## Configuration
 

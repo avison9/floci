@@ -1952,6 +1952,55 @@ class RdsQueryHandlerTest {
     }
 
     @Test
+    void clusterSnapshotActions_dispatchAndRenderTheClusterSnapshot() {
+        io.github.hectorvent.floci.services.rds.model.DbClusterSnapshot snapshot = new io.github.hectorvent.floci.services.rds.model.DbClusterSnapshot();
+        snapshot.setDbClusterSnapshotIdentifier("csnap");
+        snapshot.setDbClusterIdentifier("aurora");
+        snapshot.setEngineIdentifier("aurora-postgresql");
+        snapshot.setStatus("available");
+        snapshot.setPercentProgress(100);
+        snapshot.setDbClusterSnapshotArn("arn:aws:rds:us-east-1:000000000000:cluster-snapshot:csnap");
+        snapshot.setAvailabilityZones(List.of("us-east-1a"));
+        snapshot.setRestoreAccountIds(List.of("all"));
+        when(service.createDbClusterSnapshot(eq("csnap"), eq("aurora"), eq(Map.of()), isNull())).thenReturn(snapshot);
+        MultivaluedMap<String, String> create = params();
+        create.add("DBClusterSnapshotIdentifier", "csnap");
+        create.add("DBClusterIdentifier", "aurora");
+        Response created = handler.handle("CreateDBClusterSnapshot", create);
+        assertEquals(200, created.getStatus());
+        String body = (String) created.getEntity();
+        assertTrue(body.contains("<CreateDBClusterSnapshotResult>"));
+        assertTrue(body.contains("<DBClusterSnapshot>"));
+        assertTrue(body.contains("<AvailabilityZone>us-east-1a</AvailabilityZone>"));
+        assertTrue(body.contains("<SnapshotType>manual</SnapshotType>"));
+        assertTrue(body.contains("<PercentProgress>100</PercentProgress>"));
+        assertTrue(body.contains("<DBClusterSnapshotArn>arn:aws:rds:us-east-1:000000000000:cluster-snapshot:csnap</DBClusterSnapshotArn>"));
+
+        when(service.describeDbClusterSnapshots(isNull(), eq("aurora"), isNull(), isNull())).thenReturn(List.of(snapshot));
+        MultivaluedMap<String, String> describe = params();
+        describe.add("DBClusterIdentifier", "aurora");
+        String listBody = (String) handler.handle("DescribeDBClusterSnapshots", describe).getEntity();
+        assertTrue(listBody.contains("<DBClusterSnapshots><DBClusterSnapshot>"));
+
+        when(service.describeDbClusterSnapshotAttributes(eq("csnap"), isNull())).thenReturn(snapshot);
+        MultivaluedMap<String, String> attrs = params();
+        attrs.add("DBClusterSnapshotIdentifier", "csnap");
+        String attrBody = (String) handler.handle("DescribeDBClusterSnapshotAttributes", attrs).getEntity();
+        assertTrue(attrBody.contains("<DBClusterSnapshotAttributesResult>"));
+        assertTrue(attrBody.contains("<AttributeName>restore</AttributeName>"));
+        assertTrue(attrBody.contains("<AttributeValue>all</AttributeValue>"));
+
+        assertEquals(400, handler.handle("CreateDBClusterSnapshot", params()).getStatus());
+        assertEquals(400, handler.handle("DeleteDBClusterSnapshot", params()).getStatus());
+        MultivaluedMap<String, String> restore = params();
+        restore.add("DBClusterIdentifier", "restored");
+        restore.add("SnapshotIdentifier", "csnap");
+        Response missingEngine = handler.handle("RestoreDBClusterFromSnapshot", restore);
+        assertEquals(400, missingEngine.getStatus());
+        assertTrue(((String) missingEngine.getEntity()).contains("Engine is required."));
+    }
+
+    @Test
     void describeDbSnapshotAttributes_returnsRestoreAttribute() {
         io.github.hectorvent.floci.services.rds.model.DbSnapshot snapshot = new io.github.hectorvent.floci.services.rds.model.DbSnapshot();
         snapshot.setDbSnapshotIdentifier("mysnap");
