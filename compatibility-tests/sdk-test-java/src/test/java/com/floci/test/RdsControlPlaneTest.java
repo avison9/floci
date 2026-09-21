@@ -16,6 +16,9 @@ import software.amazon.awssdk.services.rds.model.CreateDbSubnetGroupResponse;
 import software.amazon.awssdk.services.rds.model.CreateOptionGroupResponse;
 import software.amazon.awssdk.services.rds.model.DBInstance;
 import software.amazon.awssdk.services.rds.model.DBProxyTarget;
+import software.amazon.awssdk.services.rds.model.DBSnapshot;
+import software.amazon.awssdk.services.rds.model.DbSnapshotAlreadyExistsException;
+import software.amazon.awssdk.services.rds.model.DbSnapshotNotFoundException;
 import software.amazon.awssdk.services.rds.model.InvalidDbInstanceStateException;
 import software.amazon.awssdk.services.rds.model.DescribeDbSubnetGroupsResponse;
 import software.amazon.awssdk.services.rds.model.DescribeOptionGroupsResponse;
@@ -25,6 +28,7 @@ import software.amazon.awssdk.services.rds.model.ModifyOptionGroupResponse;
 import software.amazon.awssdk.services.rds.model.OptionConfiguration;
 import software.amazon.awssdk.services.rds.model.OptionGroupNotFoundException;
 import software.amazon.awssdk.services.rds.model.OptionSetting;
+import software.amazon.awssdk.services.rds.model.Tag;
 
 import java.util.List;
 import java.util.logging.Level;
@@ -422,6 +426,57 @@ class RdsControlPlaneTest {
             assertThat(started.dbInstanceStatus()).isEqualTo("available");
             assertThat(started.endpoint().address()).isEqualTo(endpoint);
         } finally {
+            deleteDbInstance(rds, instanceName);
+        }
+    }
+
+    @Test
+    void sdkCopiesModifiesAndDeletesManualSnapshots() {
+        String instanceName = TestFixtures.uniqueName("rds-snap-db");
+        String snapshotName = TestFixtures.uniqueName("rds-snap");
+        String copyName = snapshotName + "-copy";
+        try {
+            createDbInstance(rds, instanceName, "snap-secret");
+            String sourceArn = rds.createDBSnapshot(b -> b
+                    .dbInstanceIdentifier(instanceName)
+                    .dbSnapshotIdentifier(snapshotName)
+                    .tags(Tag.builder().key("owner").value("platform").build()))
+                    .dbSnapshot().dbSnapshotArn();
+
+            DBSnapshot copy = rds.copyDBSnapshot(b -> b
+                    .sourceDBSnapshotIdentifier(sourceArn)
+                    .targetDBSnapshotIdentifier(copyName)
+                    .copyTags(true)
+                    .tags(Tag.builder().key("stage").value("test").build()))
+                    .dbSnapshot();
+            assertThat(copy.dbSnapshotIdentifier()).isEqualTo(copyName);
+            assertThat(copy.status()).isEqualTo("available");
+            assertThat(copy.snapshotType()).isEqualTo("manual");
+            assertThat(copy.sourceDBSnapshotIdentifier()).isEqualTo(sourceArn);
+            assertThat(copy.tagList()).extracting(Tag::key).containsExactlyInAnyOrder("owner", "stage");
+
+            assertThatThrownBy(() -> rds.copyDBSnapshot(b -> b
+                    .sourceDBSnapshotIdentifier(snapshotName)
+                    .targetDBSnapshotIdentifier(copyName)))
+                    .isInstanceOf(DbSnapshotAlreadyExistsException.class);
+
+            DBSnapshot modified = rds.modifyDBSnapshot(b -> b
+                    .dbSnapshotIdentifier(snapshotName)
+                    .engineVersion("16.4"))
+                    .dbSnapshot();
+            assertThat(modified.engineVersion()).isEqualTo("16.4");
+
+            DBSnapshot deleted = rds.deleteDBSnapshot(b -> b.dbSnapshotIdentifier(snapshotName)).dbSnapshot();
+            assertThat(deleted.status()).isEqualTo("deleted");
+            assertThatThrownBy(() -> rds.describeDBSnapshots(b -> b.dbSnapshotIdentifier(snapshotName)))
+                    .isInstanceOf(DbSnapshotNotFoundException.class);
+            assertThat(rds.describeDBSnapshots(b -> b.dbInstanceIdentifier(instanceName)).dbSnapshots())
+                    .extracting(DBSnapshot::dbSnapshotIdentifier)
+                    .containsExactly(copyName);
+        } finally {
+            try {
+                rds.deleteDBSnapshot(b -> b.dbSnapshotIdentifier(copyName));
+            } catch (Exception ignored) {}
             deleteDbInstance(rds, instanceName);
         }
     }
