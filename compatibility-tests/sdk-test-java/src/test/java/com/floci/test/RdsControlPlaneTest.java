@@ -537,7 +537,7 @@ class RdsControlPlaneTest {
 
             DBCluster restored = rds.restoreDBClusterFromSnapshot(b -> b
                     .dbClusterIdentifier(restoredName)
-                    .snapshotIdentifier(copyName)
+                    .snapshotIdentifier(copy.dbClusterSnapshotArn())
                     .engine("aurora-postgresql"))
                     .dbCluster();
             assertThat(restored.dbClusterIdentifier()).isEqualTo(restoredName);

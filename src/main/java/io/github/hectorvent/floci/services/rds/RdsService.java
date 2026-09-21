@@ -71,6 +71,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Predicate;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -380,7 +381,7 @@ public class RdsService implements Resettable, ResourceProvider {
         this.taggingService = taggingService;
         this.globalClusters = new io.github.hectorvent.floci.core.storage.InMemoryStorage<>();
         this.snapshots = new io.github.hectorvent.floci.core.storage.InMemoryStorage<>();
-        this.clusterSnapshots = new io.github.hectorvent.floci.core.storage.InMemoryStorage<>();
+        this.clusterSnapshots = new InMemoryStorage<>();
         this.snapshotData = new io.github.hectorvent.floci.core.storage.InMemoryStorage<>();
     }
 
@@ -1640,7 +1641,9 @@ public class RdsService implements Resettable, ResourceProvider {
                                                   Map<String, String> tags, String region) {
         String effectiveRegion = effectiveRegion(region);
         String accountId = currentAccountId();
-        DbClusterSnapshot snapshot = requireClusterSnapshot(accountId, effectiveRegion, snapshotId);
+        // SnapshotIdentifier takes the snapshot's name or its ARN (API reference).
+        String resolvedSnapshotId = clusterSnapshotIdentifierFromArnOrName(snapshotId, effectiveRegion);
+        DbClusterSnapshot snapshot = requireClusterSnapshot(accountId, effectiveRegion, resolvedSnapshotId);
         requireClusterSnapshotAvailable(snapshot, "restore from");
         if (engine == null || engine.isBlank()) {
             throw new AwsException("InvalidParameterValue", "Engine is required.", 400);
@@ -1649,9 +1652,9 @@ public class RdsService implements Resettable, ResourceProvider {
             throw new AwsException("InvalidParameterValue",
                     "The snapshot's engine is " + snapshot.getEngineIdentifier() + "; cannot restore it as " + engine + ".", 400);
         }
-        String sqlDump = snapshotData.get(clusterSnapshotDataKey(effectiveRegion, snapshotId))
+        String sqlDump = snapshotData.get(clusterSnapshotDataKey(effectiveRegion, resolvedSnapshotId))
                 .orElseThrow(() -> new AwsException("DBClusterSnapshotNotFoundFault",
-                        "DB cluster snapshot data for " + snapshotId + " not found.", 404));
+                        "DB cluster snapshot data for " + resolvedSnapshotId + " not found.", 404));
 
         DbCluster cluster = createDbCluster(clusterId, engine,
                 engineVersion != null && !engineVersion.isBlank() ? engineVersion : snapshot.getEngineVersion(),
@@ -1762,7 +1765,7 @@ public class RdsService implements Resettable, ResourceProvider {
 
     private String clusterSnapshotIdentifierFromArnOrName(String source, String region) {
         if (source == null || source.isBlank()) {
-            throw new AwsException("InvalidParameterValue", "SourceDBClusterSnapshotIdentifier is required.", 400);
+            throw new AwsException("InvalidParameterValue", "A DB cluster snapshot identifier is required.", 400);
         }
         if (!source.startsWith("arn:")) {
             return source;
@@ -1791,7 +1794,7 @@ public class RdsService implements Resettable, ResourceProvider {
 
     private synchronized DbClusterSnapshot findClusterSnapshotForScope(String accountId, String region, String snapshotId) {
         String key = dbResourceKey(region, snapshotId);
-        java.util.function.Predicate<DbClusterSnapshot> owner = snapshot -> hasRdsResourceIdentity(
+        Predicate<DbClusterSnapshot> owner = snapshot -> hasRdsResourceIdentity(
                 snapshot.getDbClusterSnapshotArn(), accountId, region, "cluster-snapshot", snapshotId);
         if (clusterSnapshots instanceof AccountAwareStorageBackend<DbClusterSnapshot> aware) {
             return aware.getForAccount(accountId, key).filter(owner).orElse(null);

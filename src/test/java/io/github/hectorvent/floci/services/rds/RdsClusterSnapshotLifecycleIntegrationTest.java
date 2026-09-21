@@ -124,9 +124,10 @@ class RdsClusterSnapshotLifecycleIntegrationTest {
         .when().post("/").then().statusCode(404)
                 .body(containsString("<Code>DBClusterSnapshotNotFoundFault</Code>"));
 
+        // Restore by ARN, the form aws_rds_cluster's snapshot_identifier is commonly given.
         query("RestoreDBClusterFromSnapshot")
                 .formParam("DBClusterIdentifier", restored)
-                .formParam("SnapshotIdentifier", copy)
+                .formParam("SnapshotIdentifier", "arn:aws:rds:us-east-1:000000000000:cluster-snapshot:" + copy)
                 .formParam("Engine", "aurora-postgresql")
         .when().post("/").then().statusCode(200)
                 .body(containsString("<RestoreDBClusterFromSnapshotResult>"))

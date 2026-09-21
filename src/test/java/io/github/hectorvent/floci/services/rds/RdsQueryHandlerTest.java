@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
 import io.github.hectorvent.floci.services.rds.model.DbCluster;
+import io.github.hectorvent.floci.services.rds.model.DbClusterSnapshot;
 import io.github.hectorvent.floci.services.rds.model.DbClusterParameterGroup;
 import io.github.hectorvent.floci.services.docdb.DocDbQueryHandler;
 import io.github.hectorvent.floci.services.neptune.NeptuneQueryHandler;
@@ -1953,7 +1954,7 @@ class RdsQueryHandlerTest {
 
     @Test
     void clusterSnapshotActions_dispatchAndRenderTheClusterSnapshot() {
-        io.github.hectorvent.floci.services.rds.model.DbClusterSnapshot snapshot = new io.github.hectorvent.floci.services.rds.model.DbClusterSnapshot();
+        DbClusterSnapshot snapshot = new DbClusterSnapshot();
         snapshot.setDbClusterSnapshotIdentifier("csnap");
         snapshot.setDbClusterIdentifier("aurora");
         snapshot.setEngineIdentifier("aurora-postgresql");

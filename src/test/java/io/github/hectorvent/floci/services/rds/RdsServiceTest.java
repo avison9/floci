@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.services.ec2.model.Vpc;
 import io.github.hectorvent.floci.services.ec2.model.VpcIpv6CidrBlockAssociation;
 import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
 import io.github.hectorvent.floci.services.rds.model.DbCluster;
+import io.github.hectorvent.floci.services.rds.model.DbClusterSnapshot;
 import io.github.hectorvent.floci.services.rds.model.DbClusterParameterGroup;
 import io.github.hectorvent.floci.services.rds.container.RdsContainerHandle;
 import io.github.hectorvent.floci.services.rds.container.RdsContainerManager;
@@ -3096,7 +3097,7 @@ class RdsServiceTest {
                 rdsService.listTagsForResource(snapshot.getDbSnapshotArn()));
     }
 
-    private io.github.hectorvent.floci.services.rds.model.DbClusterSnapshot clusterSnapshotOfNewCluster(String snapshotId) {
+    private DbClusterSnapshot clusterSnapshotOfNewCluster(String snapshotId) {
         rdsService.createDbCluster("aurora-cluster", "aurora-postgresql", "16.3",
                 "admin", "password", "dbname", false, null);
         when(containerManager.createPostgresSnapshot(any(), eq("admin"))).thenReturn("CLUSTER_DUMP");
@@ -3105,7 +3106,7 @@ class RdsServiceTest {
 
     @Test
     void createDbClusterSnapshotRecordsTheClusterAndItsData() {
-        io.github.hectorvent.floci.services.rds.model.DbClusterSnapshot snapshot = clusterSnapshotOfNewCluster("csnap");
+        DbClusterSnapshot snapshot = clusterSnapshotOfNewCluster("csnap");
 
         assertEquals("csnap", snapshot.getDbClusterSnapshotIdentifier());
         assertEquals("aurora-cluster", snapshot.getDbClusterIdentifier());
@@ -3136,9 +3137,9 @@ class RdsServiceTest {
 
     @Test
     void clusterSnapshotCanBeCopiedRestoredAndDeleted() {
-        io.github.hectorvent.floci.services.rds.model.DbClusterSnapshot source = clusterSnapshotOfNewCluster("csnap");
+        DbClusterSnapshot source = clusterSnapshotOfNewCluster("csnap");
 
-        io.github.hectorvent.floci.services.rds.model.DbClusterSnapshot copy =
+        DbClusterSnapshot copy =
                 rdsService.copyDbClusterSnapshot(source.getDbClusterSnapshotArn(), "csnap-copy", true, Map.of("stage", "test"));
         assertEquals("csnap-copy", copy.getDbClusterSnapshotIdentifier());
         assertEquals(source.getDbClusterSnapshotArn(), copy.getSourceDbClusterSnapshotArn());
@@ -3146,8 +3147,9 @@ class RdsServiceTest {
         assertEquals("DBClusterSnapshotAlreadyExistsFault", assertThrows(AwsException.class,
                 () -> rdsService.copyDbClusterSnapshot("csnap", "csnap-copy", false, null)).getErrorCode());
 
-        DbCluster restored = rdsService.restoreDbClusterFromSnapshot("restored-cluster", "csnap-copy", "aurora-postgresql",
-                null, null, null, null, null, null, null, null, Map.of("env", "restore"), "us-east-1");
+        // SnapshotIdentifier takes the ARN as well as the name, as aws_rds_cluster commonly passes it.
+        DbCluster restored = rdsService.restoreDbClusterFromSnapshot("restored-cluster", copy.getDbClusterSnapshotArn(),
+                "aurora-postgresql", null, null, null, null, null, null, null, null, Map.of("env", "restore"), "us-east-1");
         assertEquals("restored-cluster", restored.getDbClusterIdentifier());
         assertEquals("admin", restored.getMasterUsername());
         assertEquals("dbname", restored.getDatabaseName());
@@ -3158,8 +3160,12 @@ class RdsServiceTest {
         assertEquals("InvalidParameterValue", assertThrows(AwsException.class,
                 () -> rdsService.restoreDbClusterFromSnapshot("mysql-cluster", "csnap", "aurora-mysql",
                         null, null, null, null, null, null, null, null, null, "us-east-1")).getErrorCode());
+        assertEquals("DBClusterSnapshotNotFoundFault", assertThrows(AwsException.class,
+                () -> rdsService.restoreDbClusterFromSnapshot("other-cluster",
+                        "arn:aws:rds:us-east-1:123456789012:cluster-snapshot:absent", "aurora-postgresql",
+                        null, null, null, null, null, null, null, null, null, "us-east-1")).getErrorCode());
 
-        io.github.hectorvent.floci.services.rds.model.DbClusterSnapshot deleted = rdsService.deleteDbClusterSnapshot("csnap");
+        DbClusterSnapshot deleted = rdsService.deleteDbClusterSnapshot("csnap");
         assertEquals("deleted", deleted.getStatus());
         assertEquals("DBClusterSnapshotNotFoundFault", assertThrows(AwsException.class,
                 () -> rdsService.deleteDbClusterSnapshot("csnap")).getErrorCode());
@@ -3175,10 +3181,10 @@ class RdsServiceTest {
     void clusterSnapshotRestoreAttributeIsSharedLikeAnInstanceSnapshots() {
         clusterSnapshotOfNewCluster("csnap");
 
-        io.github.hectorvent.floci.services.rds.model.DbClusterSnapshot shared = rdsService.modifyDbClusterSnapshotAttribute(
+        DbClusterSnapshot shared = rdsService.modifyDbClusterSnapshotAttribute(
                 "csnap", "restore", List.of("111122223333", "all"), null, "us-east-1");
         assertEquals(List.of("111122223333", "all"), shared.getRestoreAccountIds());
-        io.github.hectorvent.floci.services.rds.model.DbClusterSnapshot narrowed = rdsService.modifyDbClusterSnapshotAttribute(
+        DbClusterSnapshot narrowed = rdsService.modifyDbClusterSnapshotAttribute(
                 "csnap", "restore", null, List.of("all"), "us-east-1");
         assertEquals(List.of("111122223333"), narrowed.getRestoreAccountIds());
         assertEquals(List.of("111122223333"),
