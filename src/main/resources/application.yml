@@ -507,6 +507,7 @@ floci:
       default-image: "floci/floci-duck:latest"
     glue:
       enabled: true
+      job-run-duration-seconds: 0   # 0 = job runs succeed as soon as they start
     ses:
       enabled: true
       # smtp-host: mailpit          # SMTP server for email relay (empty = store only)

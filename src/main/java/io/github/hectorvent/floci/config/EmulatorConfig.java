@@ -1938,6 +1938,10 @@ public interface EmulatorConfig {
     interface GlueServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        /** How long a job run stays RUNNING before it succeeds; 0 = a run succeeds as soon as it starts. */
+        @WithDefault("0")
+        int jobRunDurationSeconds();
     }
 
     interface SesServiceConfig {
