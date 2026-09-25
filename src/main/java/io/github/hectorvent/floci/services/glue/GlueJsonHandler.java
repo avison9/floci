@@ -21,6 +21,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 @ApplicationScoped
 public class GlueJsonHandler {
@@ -29,10 +30,17 @@ public class GlueJsonHandler {
     private static final TypeReference<Map<String, String>> STRING_MAP = new TypeReference<>() {};
     private static final TypeReference<List<Map<String, Object>>> MAP_LIST = new TypeReference<>() {};
     private static final TypeReference<List<Partition>> PARTITION_LIST = new TypeReference<>() {};
+    private static final TypeReference<List<TriggerAction>> TRIGGER_ACTIONS = new TypeReference<>() {};
+    private static final Set<String> RUN_ACTIONS = Set.of(
+            "StartJobRun", "GetJobRun", "GetJobRuns", "BatchStopJobRun",
+            "StartCrawler", "StopCrawler", "GetCrawler", "GetCrawlers", "BatchGetCrawlers", "GetCrawlerMetrics",
+            "UpdateCrawler",
+            "StartTrigger");
 
     private final GlueService glueService;
     private final GlueJobRunService jobRunService;
     private final GlueCrawlerRunService crawlerRunService;
+    private final GlueTriggerService triggerService;
     private final GlueSchemaRegistryService schemaRegistryService;
     private final ObjectMapper mapper;
 
@@ -40,16 +48,29 @@ public class GlueJsonHandler {
     public GlueJsonHandler(GlueService glueService,
                            GlueJobRunService jobRunService,
                            GlueCrawlerRunService crawlerRunService,
+                           GlueTriggerService triggerService,
                            GlueSchemaRegistryService schemaRegistryService,
                            ObjectMapper mapper) {
         this.glueService = glueService;
         this.jobRunService = jobRunService;
         this.crawlerRunService = crawlerRunService;
+        this.triggerService = triggerService;
         this.schemaRegistryService = schemaRegistryService;
         this.mapper = mapper;
     }
 
     public Response handle(String action, JsonNode request, String region) throws Exception {
+        Response response = dispatch(action, request, region);
+        // Runs and crawls finish when they are started, stopped or read (they settle on read), so
+        // after those requests an activated CONDITIONAL trigger watching them gets to fire. Catalog
+        // and definition requests cannot finish a run and skip the evaluation.
+        if (RUN_ACTIONS.contains(action)) {
+            triggerService.fireConditionalTriggers();
+        }
+        return response;
+    }
+
+    private Response dispatch(String action, JsonNode request, String region) throws Exception {
         return switch (action) {
             case "CreateDatabase" -> {
                 Database db = mapper.treeToValue(request.get("DatabaseInput"), Database.class);
@@ -438,8 +459,82 @@ public class GlueJsonHandler {
             case "ListDataQualityRulesets" -> Response.ok(Map.of("Rulesets", List.of())).build();
             case "GetSecurityConfigurations" -> Response.ok(Map.of(
                     "SecurityConfigurations", glueService.getSecurityConfigurations(region))).build();
+            case "CreateTrigger" -> {
+                Trigger trigger = toTrigger(request);
+                trigger.setName(request.path("Name").asText(null));
+                trigger.setWorkflowName(request.path("WorkflowName").asText(null));
+                trigger.setType(request.path("Type").asText(null));
+                Map<String, String> tags = request.hasNonNull("Tags")
+                        ? mapper.convertValue(request.get("Tags"), STRING_MAP)
+                        : null;
+                triggerService.createTrigger(trigger, request.path("StartOnCreation").asBoolean(false), tags, region);
+                yield Response.ok(Map.of("Name", trigger.getName())).build();
+            }
+            case "GetTrigger" -> Response.ok(Map.of(
+                    "Trigger", glueService.getTrigger(request.path("Name").asText(null)))).build();
+            case "GetTriggers" -> {
+                GlueService.Page<Trigger> page = glueService.getTriggers(
+                        request.path("DependentJobName").asText(null), readMaxResults(request), readNextToken(request));
+                yield Response.ok(pageResponse("Triggers", page.items(), page.nextToken())).build();
+            }
+            case "ListTriggers" -> {
+                Map<String, String> tags = request.hasNonNull("Tags")
+                        ? mapper.convertValue(request.get("Tags"), STRING_MAP)
+                        : null;
+                GlueService.Page<String> page = glueService.listTriggers(request.path("DependentJobName").asText(null),
+                        readMaxResults(request), readNextToken(request), tags, region);
+                yield Response.ok(pageResponse("TriggerNames", page.items(), page.nextToken())).build();
+            }
+            case "BatchGetTriggers" -> {
+                List<String> names = request.hasNonNull("TriggerNames")
+                        ? mapper.convertValue(request.get("TriggerNames"), STRING_LIST)
+                        : null;
+                GlueService.BatchGetTriggersResult result = glueService.batchGetTriggers(names);
+                Map<String, Object> response = new LinkedHashMap<>();
+                response.put("Triggers", result.triggers());
+                response.put("TriggersNotFound", result.triggersNotFound());
+                yield Response.ok(response).build();
+            }
+            case "UpdateTrigger" -> {
+                Trigger update = request.hasNonNull("TriggerUpdate") ? toTrigger(request.get("TriggerUpdate")) : null;
+                yield Response.ok(Map.of("Trigger",
+                        triggerService.updateTrigger(request.path("Name").asText(null), update))).build();
+            }
+            case "DeleteTrigger" -> {
+                String name = request.path("Name").asText(null);
+                triggerService.deleteTrigger(name, region);
+                yield Response.ok(Map.of("Name", name)).build();
+            }
+            case "StartTrigger" -> {
+                String name = request.path("Name").asText(null);
+                triggerService.startTrigger(name);
+                yield Response.ok(Map.of("Name", name)).build();
+            }
+            case "StopTrigger" -> {
+                String name = request.path("Name").asText(null);
+                triggerService.stopTrigger(name);
+                yield Response.ok(Map.of("Name", name)).build();
+            }
             default -> throw new AwsException("InvalidAction", "Action " + action + " is not supported", 400);
         };
+    }
+
+    /** The definition members CreateTrigger and TriggerUpdate share. */
+    private Trigger toTrigger(JsonNode node) throws Exception {
+        Trigger trigger = new Trigger();
+        trigger.setDescription(node.path("Description").asText(null));
+        trigger.setSchedule(node.path("Schedule").asText(null));
+        if (node.hasNonNull("Actions")) {
+            trigger.setActions(mapper.convertValue(node.get("Actions"), TRIGGER_ACTIONS));
+        }
+        if (node.hasNonNull("Predicate")) {
+            trigger.setPredicate(mapper.treeToValue(node.get("Predicate"), Predicate.class));
+        }
+        if (node.hasNonNull("EventBatchingCondition")) {
+            trigger.setEventBatchingCondition(
+                    mapper.treeToValue(node.get("EventBatchingCondition"), EventBatchingCondition.class));
+        }
+        return trigger;
     }
 
     private Response handleUpdateColumnStatisticsForTable(JsonNode request) {

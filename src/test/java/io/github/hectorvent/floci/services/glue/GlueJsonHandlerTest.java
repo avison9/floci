@@ -46,9 +46,13 @@ class GlueJsonHandlerTest {
         GlueService glueService = new GlueService(
                 storageFactory, schemaRegistryService, regionResolver, new ResourceGroupsTaggingService(storageFactory),
                 new KmsService(storageFactory, regionResolver));
-        handler = new GlueJsonHandler(glueService,
-                new GlueJobRunService(new InMemoryStorage<>(), glueService, 0, Clock.systemUTC()),
-                new GlueCrawlerRunService(new InMemoryStorage<>(), glueService, 0, Clock.systemUTC()),
+        GlueJobRunService jobRunService =
+                new GlueJobRunService(new InMemoryStorage<>(), new InMemoryStorage<>(), glueService, 0, Clock.systemUTC());
+        GlueCrawlerRunService crawlerRunService =
+                new GlueCrawlerRunService(new InMemoryStorage<>(), glueService, 0, Clock.systemUTC());
+        handler = new GlueJsonHandler(glueService, jobRunService, crawlerRunService,
+                new GlueTriggerService(new InMemoryStorage<>(), glueService,
+                        jobRunService, crawlerRunService),
                 schemaRegistryService, mapper);
     }
 
@@ -946,5 +950,75 @@ class GlueJsonHandlerTest {
         assertEquals("tagged", got.get("Crawlers").get(0).get("Name").asText());
         assertEquals("READY", got.get("Crawlers").get(0).get("State").asText());
         assertEquals("absent", got.get("CrawlersNotFound").get(0).asText());
+    }
+
+    /**
+     * Trigger CRUD on the wire: Create, Start, Stop and Delete answer with the name, Get and
+     * UpdateTrigger with the trigger, and the definition round trips with its predicate.
+     */
+    @Test
+    void triggerOperationsAnswerWithTheDocumentedBodies() throws Exception {
+        createJobWithTags("extract", Map.of());
+        createJobWithTags("load", Map.of());
+        ObjectNode create = mapper.createObjectNode();
+        create.put("Name", "after-extract");
+        create.put("Type", "CONDITIONAL");
+        create.put("StartOnCreation", true);
+        create.putArray("Actions").addObject().put("JobName", "load");
+        ObjectNode predicate = create.putObject("Predicate");
+        predicate.put("Logical", "AND");
+        predicate.putArray("Conditions").addObject()
+                .put("LogicalOperator", "EQUALS").put("JobName", "extract").put("State", "SUCCEEDED");
+        create.putObject("Tags").put("team", "data");
+
+        JsonNode created = mapper.valueToTree(handler.handle("CreateTrigger", create, REGION).getEntity());
+        assertEquals("after-extract", created.get("Name").asText());
+
+        ObjectNode byName = mapper.createObjectNode().put("Name", "after-extract");
+        JsonNode trigger = mapper.valueToTree(handler.handle("GetTrigger", byName, REGION).getEntity()).get("Trigger");
+        assertEquals("CONDITIONAL", trigger.get("Type").asText());
+        assertEquals("ACTIVATED", trigger.get("State").asText());
+        assertEquals("load", trigger.get("Actions").get(0).get("JobName").asText());
+        assertEquals("SUCCEEDED", trigger.get("Predicate").get("Conditions").get(0).get("State").asText());
+        assertFalse(trigger.has("Schedule"));
+
+        ObjectNode tags = mapper.createObjectNode();
+        tags.put("ResourceArn", "arn:aws:glue:" + REGION + ":" + ACCOUNT_ID + ":trigger/after-extract");
+        assertEquals("data", mapper.valueToTree(handler.handle("GetTags", tags, REGION).getEntity())
+                .get("Tags").get("team").asText());
+
+        ObjectNode update = mapper.createObjectNode().put("Name", "after-extract");
+        update.putObject("TriggerUpdate").put("Description", "load after extract");
+        JsonNode updated = mapper.valueToTree(handler.handle("UpdateTrigger", update, REGION).getEntity());
+        assertEquals("load after extract", updated.get("Trigger").get("Description").asText());
+
+        assertEquals("after-extract", mapper.valueToTree(
+                handler.handle("StopTrigger", byName, REGION).getEntity()).get("Name").asText());
+        assertEquals("after-extract", mapper.valueToTree(
+                handler.handle("DeleteTrigger", byName, REGION).getEntity()).get("Name").asText());
+        JsonNode names = mapper.valueToTree(handler.handle("ListTriggers", mapper.createObjectNode(), REGION).getEntity());
+        assertEquals(0, names.get("TriggerNames").size());
+    }
+
+    /** A conditional trigger fires within the request that finishes the run it watches. */
+    @Test
+    void conditionalTriggerFiresAfterTheRequestThatFinishesTheWatchedRun() throws Exception {
+        createJobWithTags("extract", Map.of());
+        createJobWithTags("load", Map.of());
+        ObjectNode create = mapper.createObjectNode();
+        create.put("Name", "after-extract");
+        create.put("Type", "CONDITIONAL");
+        create.put("StartOnCreation", true);
+        create.putArray("Actions").addObject().put("JobName", "load");
+        create.putObject("Predicate").putArray("Conditions").addObject()
+                .put("LogicalOperator", "EQUALS").put("JobName", "extract").put("State", "SUCCEEDED");
+        handler.handle("CreateTrigger", create, REGION);
+
+        handler.handle("StartJobRun", mapper.createObjectNode().put("JobName", "extract"), REGION);
+
+        JsonNode runs = mapper.valueToTree(handler.handle(
+                "GetJobRuns", mapper.createObjectNode().put("JobName", "load"), REGION).getEntity()).get("JobRuns");
+        assertEquals(1, runs.size());
+        assertEquals("after-extract", runs.get(0).get("TriggerName").asText());
     }
 }

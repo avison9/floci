@@ -61,7 +61,7 @@ class GlueJobRunServiceTest {
     }
 
     private GlueJobRunService service(int runDurationSeconds) {
-        return new GlueJobRunService(runStore, glueService, runDurationSeconds, clock);
+        return new GlueJobRunService(runStore, new InMemoryStorage<>(), glueService, runDurationSeconds, clock);
     }
 
     private Job createJob(String name, Integer maxConcurrentRuns, Integer timeoutMinutes) {
@@ -309,7 +309,7 @@ class GlueJobRunServiceTest {
     void startRacingDeleteNeverLeavesARunBehind() throws Exception {
         createJob("etl", null, null);
         PausingStore store = new PausingStore(runStore);
-        GlueJobRunService service = new GlueJobRunService(store, glueService, 60, clock);
+        GlueJobRunService service = new GlueJobRunService(store, new InMemoryStorage<>(), glueService, 60, clock);
         ExecutorService pool = Executors.newFixedThreadPool(2);
         try {
             Future<?> start = pool.submit(() -> service.startJobRun("etl", null, new JobRun()));

@@ -15,10 +15,14 @@ public class CrawlerRunRecord {
     private String crawlerName;
     private Instant currentStart;
     private String currentMessagePrefix;
+    private String currentCrawlId;
+    private String currentOriginRunId;
     private Instant lastStart;
     private String lastStatus;
     private String lastMessagePrefix;
     private List<Double> runtimeSeconds = new ArrayList<>();
+    private long finishedCount;
+    private List<FinishedCrawl> recentCrawls = new ArrayList<>();
 
     public CrawlerRunRecord() {}
 
@@ -34,6 +38,12 @@ public class CrawlerRunRecord {
     public Instant getLastStart() { return lastStart; }
     public void setLastStart(Instant lastStart) { this.lastStart = lastStart; }
 
+    public String getCurrentCrawlId() { return currentCrawlId; }
+    public void setCurrentCrawlId(String currentCrawlId) { this.currentCrawlId = currentCrawlId; }
+
+    public String getCurrentOriginRunId() { return currentOriginRunId; }
+    public void setCurrentOriginRunId(String currentOriginRunId) { this.currentOriginRunId = currentOriginRunId; }
+
     public String getLastStatus() { return lastStatus; }
     public void setLastStatus(String lastStatus) { this.lastStatus = lastStatus; }
 
@@ -42,4 +52,10 @@ public class CrawlerRunRecord {
 
     public List<Double> getRuntimeSeconds() { return runtimeSeconds; }
     public void setRuntimeSeconds(List<Double> runtimeSeconds) { this.runtimeSeconds = runtimeSeconds; }
+
+    public long getFinishedCount() { return finishedCount; }
+    public void setFinishedCount(long finishedCount) { this.finishedCount = finishedCount; }
+
+    public List<FinishedCrawl> getRecentCrawls() { return recentCrawls; }
+    public void setRecentCrawls(List<FinishedCrawl> recentCrawls) { this.recentCrawls = recentCrawls; }
 }

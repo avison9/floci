@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.glue.model.ExecutionProperty;
 import io.github.hectorvent.floci.services.glue.model.Job;
 import io.github.hectorvent.floci.services.glue.model.JobRun;
+import io.github.hectorvent.floci.services.glue.model.JobRunBookkeeping;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -18,6 +19,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 
@@ -50,6 +52,10 @@ public class GlueJobRunService {
     private static final String LOG_GROUP_NAME = "/aws-glue/jobs";
 
     private final StorageBackend<String, JobRun> runStore;
+    // Per run: the order in which Floci saw it finish (a conditional trigger's position; unlike
+    // CompletedOn it never ties), its trigger chain origin, and that origin's triggered run count.
+    private final StorageBackend<String, JobRunBookkeeping> bookkeepingStore;
+    private long nextCompletionOrder;
     private final GlueService glueService;
     private final int runDurationSeconds;
     private final Clock clock;
@@ -57,16 +63,18 @@ public class GlueJobRunService {
     @Inject
     public GlueJobRunService(StorageFactory storageFactory, GlueService glueService, EmulatorConfig config) {
         this(storageFactory.create("glue", "job_runs.json", new TypeReference<>() {}),
+                storageFactory.create("glue", "job_run_bookkeeping.json", new TypeReference<>() {}),
                 glueService, config.services().glue().jobRunDurationSeconds(), Clock.systemUTC());
     }
 
-    GlueJobRunService(StorageBackend<String, JobRun> runStore, GlueService glueService,
-                      int runDurationSeconds, Clock clock) {
+    GlueJobRunService(StorageBackend<String, JobRun> runStore, StorageBackend<String, JobRunBookkeeping> bookkeepingStore,
+                      GlueService glueService, int runDurationSeconds, Clock clock) {
         if (runDurationSeconds < 0) {
             throw new IllegalArgumentException(
                     "floci.services.glue.job-run-duration-seconds must not be negative: " + runDurationSeconds);
         }
         this.runStore = runStore;
+        this.bookkeepingStore = bookkeepingStore;
         this.glueService = glueService;
         this.runDurationSeconds = runDurationSeconds;
         this.clock = clock;
@@ -79,6 +87,15 @@ public class GlueJobRunService {
      * unset field falls back to the job definition.
      */
     public synchronized JobRun startJobRun(String jobName, String previousRunId, JobRun overrides) {
+        return startJobRun(jobName, previousRunId, overrides, null);
+    }
+
+    /**
+     * As {@link #startJobRun(String, String, JobRun)}, for a run a trigger starts on behalf of
+     * {@code originRunId}; a null origin makes the run its own origin.
+     */
+    public synchronized JobRun startJobRun(String jobName, String previousRunId, JobRun overrides,
+                                           String originRunId) {
         Job job = glueService.getJob(jobName);
         // The job's own Timeout is stored as given by CreateJob/UpdateJob, so check what the run inherits.
         Integer timeout = firstNonNull(overrides.getTimeout(), job.getTimeout());
@@ -102,6 +119,7 @@ public class GlueJobRunService {
         run.setId(newRunId());
         run.setAttempt(0);
         run.setPreviousRunId(previousRunId);
+        run.setTriggerName(overrides.getTriggerName());
         run.setJobName(job.getName());
         run.setJobMode(job.getJobMode());
         run.setJobRunQueuingEnabled(queuingEnabled);
@@ -123,6 +141,9 @@ public class GlueJobRunService {
         run.setLogGroupName(LOG_GROUP_NAME);
         run.setExecutionTime(0);
         runStore.put(run.getId(), run);
+        JobRunBookkeeping bookkeeping = new JobRunBookkeeping();
+        bookkeeping.setOriginRunId(originRunId != null ? originRunId : run.getId());
+        bookkeepingStore.put(run.getId(), bookkeeping);
         LOG.infov("Started Glue job run {0} for job {1}", run.getId(), jobName);
         return settle(run);
     }
@@ -180,10 +201,37 @@ public class GlueJobRunService {
         return new StopResult(stopped, errors);
     }
 
+    /**
+     * The job's finished runs after {@code afterPosition} (all when null or empty), in the order Floci saw
+     * them finish; what a conditional trigger on the job processes. Every run that has finished by now
+     * is settled first, so a run settled later always comes after the last position a trigger has seen.
+     */
+    public synchronized List<GlueRunCompletion> completionsAfter(String jobName, String afterPosition) {
+        List<GlueRunCompletion> completions = new ArrayList<>();
+        for (JobRun run : runsOf(jobName)) {
+            settle(run);
+            if (isTerminal(run)) {
+                String position = positionOf(run);
+                if (afterPosition == null || afterPosition.isEmpty() || position.compareTo(afterPosition) > 0) {
+                    completions.add(new GlueRunCompletion(position, run.getCompletedOn(), run.getJobRunState(),
+                            bookkeepingOf(run.getId()).getOriginRunId()));
+                }
+            }
+        }
+        completions.sort(Comparator.comparing(GlueRunCompletion::position));
+        return completions;
+    }
+
+    // Zero padded so that comparing positions as strings follows the completion order.
+    private String positionOf(JobRun run) {
+        return String.format("%020d", bookkeepingOf(run.getId()).getCompletionOrder());
+    }
+
     /** Runs belong to their job: deleting the job removes them, as it does on AWS. */
     public synchronized void deleteRuns(String jobName) {
         for (JobRun run : runsOf(jobName)) {
             runStore.delete(run.getId());
+            bookkeepingStore.delete(run.getId());
         }
     }
 
@@ -215,6 +263,42 @@ public class GlueJobRunService {
         run.setExecutionTime((int) Duration.between(run.getStartedOn(), completedOn).toSeconds());
         run.setErrorMessage(errorMessage);
         runStore.put(run.getId(), run);
+        JobRunBookkeeping bookkeeping = bookkeepingOf(run.getId());
+        bookkeeping.setCompletionOrder(nextCompletionOrder());
+        bookkeepingStore.put(run.getId(), bookkeeping);
+    }
+
+    private long nextCompletionOrder() {
+        if (nextCompletionOrder == 0) {
+            long highest = 0;
+            for (JobRunBookkeeping bookkeeping : bookkeepingStore.scan(key -> true)) {
+                highest = Math.max(highest, bookkeeping.getCompletionOrder());
+            }
+            nextCompletionOrder = highest + 1;
+        }
+        return nextCompletionOrder++;
+    }
+
+    private JobRunBookkeeping bookkeepingOf(String runId) {
+        return bookkeepingStore.get(runId).orElseGet(() -> {
+            JobRunBookkeeping fresh = new JobRunBookkeeping();
+            fresh.setOriginRunId(runId);
+            return fresh;
+        });
+    }
+
+    /**
+     * Records that triggers are about to start {@code runs} more runs on behalf of the origin job run,
+     * if that keeps the origin within {@code limit}. False when the origin run no longer exists.
+     */
+    public synchronized boolean claimTriggeredRuns(String originRunId, int runs, int limit) {
+        Optional<JobRunBookkeeping> origin = bookkeepingStore.get(originRunId);
+        if (origin.isEmpty() || origin.get().getTriggeredRuns() + runs > limit) {
+            return false;
+        }
+        origin.get().setTriggeredRuns(origin.get().getTriggeredRuns() + runs);
+        bookkeepingStore.put(originRunId, origin.get());
+        return true;
     }
 
     private JobRun findRun(String jobName, String runId) {

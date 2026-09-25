@@ -20,6 +20,9 @@ public class JobRun {
     @JsonProperty("PreviousRunId")
     private String previousRunId;
 
+    @JsonProperty("TriggerName")
+    private String triggerName;
+
     @JsonProperty("JobName")
     private String jobName;
 
@@ -93,6 +96,9 @@ public class JobRun {
 
     public String getPreviousRunId() { return previousRunId; }
     public void setPreviousRunId(String previousRunId) { this.previousRunId = previousRunId; }
+
+    public String getTriggerName() { return triggerName; }
+    public void setTriggerName(String triggerName) { this.triggerName = triggerName; }
 
     public String getJobName() { return jobName; }
     public void setJobName(String jobName) { this.jobName = jobName; }

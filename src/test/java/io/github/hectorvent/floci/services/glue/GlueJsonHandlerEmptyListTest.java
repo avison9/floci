@@ -45,9 +45,13 @@ class GlueJsonHandlerEmptyListTest {
         GlueService glueService = new GlueService(
             storageFactory, schemaRegistryService, regionResolver,
             new ResourceGroupsTaggingService(storageFactory), new KmsService(storageFactory, regionResolver));
-        handler = new GlueJsonHandler(glueService,
-                new GlueJobRunService(new InMemoryStorage<>(), glueService, 0, Clock.systemUTC()),
-                new GlueCrawlerRunService(new InMemoryStorage<>(), glueService, 0, Clock.systemUTC()),
+        GlueJobRunService jobRunService =
+                new GlueJobRunService(new InMemoryStorage<>(), new InMemoryStorage<>(), glueService, 0, Clock.systemUTC());
+        GlueCrawlerRunService crawlerRunService =
+                new GlueCrawlerRunService(new InMemoryStorage<>(), glueService, 0, Clock.systemUTC());
+        handler = new GlueJsonHandler(glueService, jobRunService, crawlerRunService,
+                new GlueTriggerService(new InMemoryStorage<>(), glueService,
+                        jobRunService, crawlerRunService),
                 schemaRegistryService, mapper);
     }
 

@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.glue.model.Crawler;
 import io.github.hectorvent.floci.services.glue.model.CrawlerRunRecord;
+import io.github.hectorvent.floci.services.glue.model.FinishedCrawl;
 import io.github.hectorvent.floci.services.glue.model.LastCrawlInfo;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -43,6 +44,7 @@ public class GlueCrawlerRunService {
     static final String STATUS_CANCELLED = "CANCELLED";
 
     private static final String LOG_GROUP = "/aws-glue/crawlers";
+    static final String CRAWL_ID_PREFIX = "crawl:";
     // Enough history for a stable median without letting a long-lived crawler grow without bound.
     private static final int MAX_RUNTIME_HISTORY = 100;
 
@@ -69,17 +71,30 @@ public class GlueCrawlerRunService {
         this.clock = clock;
     }
 
-    public synchronized void startCrawler(String name) {
+    public synchronized String startCrawler(String name) {
+        return startCrawler(name, null);
+    }
+
+    /**
+     * Starts a crawl and returns its crawl id ({@code crawl:} and a UUID, so ids never repeat, even for
+     * a crawler deleted and created again). A trigger passes the origin of its chain; a null origin
+     * makes the crawl its own origin.
+     */
+    public synchronized String startCrawler(String name, String originRunId) {
         glueService.getCrawler(name);
         CrawlerRunRecord record = settledRecord(name);
         if (record.getCurrentStart() != null) {
             throw new AwsException("CrawlerRunningException", "Crawler with name " + name + " has already started", 400);
         }
+        String crawlId = CRAWL_ID_PREFIX + UUID.randomUUID();
         record.setCurrentStart(clock.instant());
         record.setCurrentMessagePrefix(UUID.randomUUID().toString());
+        record.setCurrentCrawlId(crawlId);
+        record.setCurrentOriginRunId(originRunId != null ? originRunId : crawlId);
         recordStore.put(name, record);
         LOG.infov("Started Glue crawler {0}", name);
         settle(record);
+        return crawlId;
     }
 
     public synchronized void stopCrawler(String name) {
@@ -147,6 +162,43 @@ public class GlueCrawlerRunService {
             metrics.add(metricsFor(settledRecord(name)));
         }
         return glueService.paginate(metrics, maxResults, nextToken);
+    }
+
+    /**
+     * The crawler's finished crawls after {@code afterPosition} (all kept history when null or empty), oldest
+     * first; what a conditional trigger on the crawler processes. Positions are crawl sequence numbers.
+     */
+    public synchronized List<GlueRunCompletion> completionsAfter(String name, String afterPosition) {
+        CrawlerRunRecord record = settledRecord(name);
+        long after = afterPosition == null || afterPosition.isEmpty() ? 0 : Long.parseLong(afterPosition);
+        List<GlueRunCompletion> completions = new ArrayList<>();
+        for (FinishedCrawl crawl : record.getRecentCrawls()) {
+            if (crawl.getSequence() > after) {
+                completions.add(new GlueRunCompletion(Long.toString(crawl.getSequence()), crawl.getFinishedAt(),
+                        crawl.getStatus(), crawl.getOriginRunId()));
+            }
+        }
+        return completions;
+    }
+
+    /**
+     * Records that triggers are about to start {@code runs} more runs on behalf of the origin crawl, if
+     * that keeps it within {@code limit}. False when the crawl is no longer in its crawler's history.
+     */
+    public synchronized boolean claimTriggeredRuns(String originCrawlId, int runs, int limit) {
+        for (CrawlerRunRecord record : recordStore.scan(key -> true)) {
+            for (FinishedCrawl crawl : record.getRecentCrawls()) {
+                if (originCrawlId.equals(crawl.getCrawlId())) {
+                    if (crawl.getTriggeredRuns() + runs > limit) {
+                        return false;
+                    }
+                    crawl.setTriggeredRuns(crawl.getTriggeredRuns() + runs);
+                    recordStore.put(record.getCrawlerName(), record);
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     public synchronized void updateCrawler(Crawler update) {
@@ -235,11 +287,27 @@ public class GlueCrawlerRunService {
             runtimes.removeFirst();
         }
         record.setRuntimeSeconds(runtimes);
+        FinishedCrawl finished = new FinishedCrawl();
+        finished.setSequence(record.getFinishedCount() + 1);
+        finished.setStartedAt(record.getCurrentStart());
+        finished.setFinishedAt(finishedAt);
+        finished.setStatus(status);
+        finished.setCrawlId(record.getCurrentCrawlId());
+        finished.setOriginRunId(record.getCurrentOriginRunId());
+        List<FinishedCrawl> recent = new ArrayList<>(record.getRecentCrawls());
+        recent.add(finished);
+        if (recent.size() > MAX_RUNTIME_HISTORY) {
+            recent.removeFirst();
+        }
+        record.setRecentCrawls(recent);
+        record.setFinishedCount(finished.getSequence());
         record.setLastStart(record.getCurrentStart());
         record.setLastStatus(status);
         record.setLastMessagePrefix(record.getCurrentMessagePrefix());
         record.setCurrentStart(null);
         record.setCurrentMessagePrefix(null);
+        record.setCurrentCrawlId(null);
+        record.setCurrentOriginRunId(null);
         recordStore.put(record.getCrawlerName(), record);
     }
 }
