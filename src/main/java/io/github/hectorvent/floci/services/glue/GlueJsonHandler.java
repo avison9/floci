@@ -32,16 +32,19 @@ public class GlueJsonHandler {
 
     private final GlueService glueService;
     private final GlueJobRunService jobRunService;
+    private final GlueCrawlerRunService crawlerRunService;
     private final GlueSchemaRegistryService schemaRegistryService;
     private final ObjectMapper mapper;
 
     @Inject
     public GlueJsonHandler(GlueService glueService,
                            GlueJobRunService jobRunService,
+                           GlueCrawlerRunService crawlerRunService,
                            GlueSchemaRegistryService schemaRegistryService,
                            ObjectMapper mapper) {
         this.glueService = glueService;
         this.jobRunService = jobRunService;
+        this.crawlerRunService = crawlerRunService;
         this.schemaRegistryService = schemaRegistryService;
         this.mapper = mapper;
     }
@@ -302,26 +305,74 @@ public class GlueJsonHandler {
             }
             case "GetCrawler" -> {
                 GetCrawlerRequest req = mapper.treeToValue(request, GetCrawlerRequest.class);
-                yield Response.ok(new GetCrawlerResponse(glueService.getCrawler(req.getName()))).build();
+                yield Response.ok(new GetCrawlerResponse(
+                        crawlerRunService.withRunState(glueService.getCrawler(req.getName())))).build();
             }
             case "GetCrawlers" -> {
                 GetCrawlersRequest req = mapper.treeToValue(request, GetCrawlersRequest.class);
                 GlueService.Page<Crawler> page = glueService.getCrawlers(req.getMaxResults(), req.getNextToken());
                 GetCrawlersResponse res = new GetCrawlersResponse();
-                res.setCrawlers(page.items());
+                res.setCrawlers(crawlerRunService.withRunState(page.items()));
                 res.setNextToken(page.nextToken());
                 yield Response.ok(res).build();
             }
             case "UpdateCrawler" -> {
                 UpdateCrawlerRequest req = mapper.treeToValue(request, UpdateCrawlerRequest.class);
                 Crawler update = toDomain(req);
-                glueService.updateCrawler(update);
+                crawlerRunService.updateCrawler(update);
                 yield Response.ok().build();
             }
             case "DeleteCrawler" -> {
                 DeleteCrawlerRequest req = mapper.treeToValue(request, DeleteCrawlerRequest.class);
-                glueService.deleteCrawler(req.getName(), region);
+                crawlerRunService.deleteCrawler(req.getName(), region);
                 yield Response.ok().build();
+            }
+            case "ListCrawlers" -> {
+                Map<String, String> tags = request.hasNonNull("Tags")
+                        ? mapper.convertValue(request.get("Tags"), STRING_MAP)
+                        : null;
+                GlueService.Page<String> page = glueService.listCrawlers(
+                        readMaxResults(request), readNextToken(request), tags, region);
+                yield Response.ok(pageResponse("CrawlerNames", page.items(), page.nextToken())).build();
+            }
+            case "BatchGetCrawlers" -> {
+                List<String> names = request.hasNonNull("CrawlerNames")
+                        ? mapper.convertValue(request.get("CrawlerNames"), STRING_LIST)
+                        : null;
+                GlueService.BatchGetCrawlersResult result = glueService.batchGetCrawlers(names);
+                Map<String, Object> response = new LinkedHashMap<>();
+                response.put("Crawlers", crawlerRunService.withRunState(result.crawlers()));
+                response.put("CrawlersNotFound", result.crawlersNotFound());
+                yield Response.ok(response).build();
+            }
+            case "StartCrawler" -> {
+                crawlerRunService.startCrawler(request.path("Name").asText(null));
+                yield Response.ok(Map.of()).build();
+            }
+            case "StopCrawler" -> {
+                crawlerRunService.stopCrawler(request.path("Name").asText(null));
+                yield Response.ok(Map.of()).build();
+            }
+            case "GetCrawlerMetrics" -> {
+                List<String> names = request.hasNonNull("CrawlerNameList")
+                        ? mapper.convertValue(request.get("CrawlerNameList"), STRING_LIST)
+                        : null;
+                GlueService.Page<Map<String, Object>> page = crawlerRunService.getCrawlerMetrics(
+                        names, readMaxResults(request), readNextToken(request));
+                yield Response.ok(pageResponse("CrawlerMetricsList", page.items(), page.nextToken())).build();
+            }
+            case "UpdateCrawlerSchedule" -> {
+                crawlerRunService.updateCrawlerSchedule(request.path("CrawlerName").asText(null),
+                        request.path("Schedule").asText(null));
+                yield Response.ok(Map.of()).build();
+            }
+            case "StartCrawlerSchedule" -> {
+                crawlerRunService.startCrawlerSchedule(request.path("CrawlerName").asText(null));
+                yield Response.ok(Map.of()).build();
+            }
+            case "StopCrawlerSchedule" -> {
+                crawlerRunService.stopCrawlerSchedule(request.path("CrawlerName").asText(null));
+                yield Response.ok(Map.of()).build();
             }
             case "CreateConnection" -> handleCreateConnection(request, region);
             case "GetConnection" -> handleGetConnection(request);

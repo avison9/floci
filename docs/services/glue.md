@@ -165,8 +165,23 @@ waiting in `WAITING`.
 | CreateCrawler | Creates a new crawler with specified targets, role, configuration, and optional schedule. |
 | GetCrawler | Retrieves metadata for a specified crawler. |
 | GetCrawlers | Retrieves metadata for all crawlers defined in the customer account. |
-| UpdateCrawler | Updates a crawler. |
-| DeleteCrawler | Removes a specified crawler from the AWS Glue Data Catalog. |
+| ListCrawlers | Lists crawler names, optionally only those carrying every given tag. |
+| BatchGetCrawlers | Retrieves several crawlers by name and reports the names not found. |
+| UpdateCrawler | Updates a crawler; refused with `CrawlerRunningException` while a crawl runs. |
+| DeleteCrawler | Removes a crawler and its crawl history; refused with `CrawlerRunningException` while a crawl runs. |
+| StartCrawler | Starts a crawl. |
+| StopCrawler | Stops the running crawl, which is then recorded as `CANCELLED`. |
+| GetCrawlerMetrics | Reports time left, last and median runtime for the named crawlers, or for all of them. |
+| UpdateCrawlerSchedule | Replaces a crawler's cron schedule. |
+| StartCrawlerSchedule | Sets a crawler's schedule to `SCHEDULED`. |
+| StopCrawlerSchedule | Sets a crawler's schedule to `NOT_SCHEDULED`. |
+
+Crawls do not read the data store or write tables. A crawl follows the crawler's state machine:
+`GetCrawler` reports `RUNNING` with `CrawlElapsedTime` while it runs, then `READY` with a `LastCrawl`
+of `SUCCEEDED` (or `CANCELLED` after `StopCrawler`). With the default `crawler-run-duration-seconds` of
+0 a crawl finishes as soon as it starts; a positive value keeps the crawler `RUNNING` that long.
+`GetCrawlerMetrics` reports zero tables created, updated and deleted. Schedules are stored and their
+state can be switched, but a schedule never starts a crawl on its own.
 
 #### Classifiers
 
@@ -231,6 +246,7 @@ Supported schema formats are `AVRO`, `JSON`, and `PROTOBUF`. Compatibility modes
 |---|---|---|
 | `FLOCI_SERVICES_GLUE_ENABLED` | `true` | Enable or disable the service |
 | `FLOCI_SERVICES_GLUE_JOB_RUN_DURATION_SECONDS` | `0` | Seconds a job run stays `RUNNING` before it succeeds; `0` finishes it as soon as it starts |
+| `FLOCI_SERVICES_GLUE_CRAWLER_RUN_DURATION_SECONDS` | `0` | Seconds a crawl keeps the crawler `RUNNING` before it succeeds; `0` finishes it as soon as it starts |
 
 ## Integration with Athena
 

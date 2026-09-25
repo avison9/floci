@@ -47,6 +47,7 @@ class GlueJsonHandlerEmptyListTest {
             new ResourceGroupsTaggingService(storageFactory), new KmsService(storageFactory, regionResolver));
         handler = new GlueJsonHandler(glueService,
                 new GlueJobRunService(new InMemoryStorage<>(), glueService, 0, Clock.systemUTC()),
+                new GlueCrawlerRunService(new InMemoryStorage<>(), glueService, 0, Clock.systemUTC()),
                 schemaRegistryService, mapper);
     }
 

@@ -14,13 +14,12 @@ import io.github.hectorvent.floci.services.glue.model.JobRun;
 import io.github.hectorvent.floci.services.glue.schemaregistry.GlueSchemaRegistryService;
 import io.github.hectorvent.floci.services.kms.KmsService;
 import io.github.hectorvent.floci.services.resourcegroupstagging.ResourceGroupsTaggingService;
+import io.github.hectorvent.floci.testing.MutableClock;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
-import java.time.ZoneId;
-import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -45,7 +44,6 @@ class GlueJobRunServiceTest {
     private static final String REGION = "us-east-1";
     private static final String ACCOUNT_ID = "000000000000";
     private static final String ROLE = "arn:aws:iam::000000000000:role/glue";
-    private static final Instant T0 = Instant.parse("2026-09-25T12:00:00Z");
 
     private GlueService glueService;
     private InMemoryStorage<String, JobRun> runStore;
@@ -59,7 +57,7 @@ class GlueJobRunServiceTest {
                 regionResolver, new ResourceGroupsTaggingService(storageFactory),
                 new KmsService(storageFactory, regionResolver));
         runStore = new InMemoryStorage<>();
-        clock = new MutableClock(T0);
+        clock = new MutableClock();
     }
 
     private GlueJobRunService service(int runDurationSeconds) {
@@ -87,12 +85,15 @@ class GlueJobRunServiceTest {
     void runSucceedsAsSoonAsItStartsByDefault() {
         createJob("etl", null, null);
 
+        Instant before = clock.instant();
         JobRun run = service(0).startJobRun("etl", null, new JobRun());
+        Instant after = clock.instant();
 
         assertTrue(run.getId().matches("jr_[0-9a-f]{64}"), run.getId());
         assertEquals("SUCCEEDED", run.getJobRunState());
-        assertEquals(T0, run.getStartedOn());
-        assertEquals(T0, run.getCompletedOn());
+        assertTrue(run.getStartedOn().isAfter(before) && run.getStartedOn().isBefore(after),
+                "StartedOn " + run.getStartedOn() + " should be read from the clock during StartJobRun");
+        assertEquals(run.getStartedOn(), run.getCompletedOn());
         assertEquals(0, run.getExecutionTime());
         assertEquals(0, run.getAttempt());
         assertEquals("G.1X", run.getWorkerType());
@@ -124,17 +125,17 @@ class GlueJobRunServiceTest {
     void runStaysRunningUntilTheConfiguredDurationHasPassed() {
         createJob("etl", null, null);
         GlueJobRunService service = service(60);
-        String runId = service.startJobRun("etl", null, new JobRun()).getId();
+        JobRun started = service.startJobRun("etl", null, new JobRun());
 
-        clock.set(T0.plusSeconds(59));
-        JobRun running = service.getJobRun("etl", runId);
+        clock.advance(Duration.ofSeconds(59));
+        JobRun running = service.getJobRun("etl", started.getId());
         assertEquals("RUNNING", running.getJobRunState());
         assertNull(running.getCompletedOn());
 
-        clock.set(T0.plusSeconds(90));
-        JobRun finished = service.getJobRun("etl", runId);
+        clock.advance(Duration.ofSeconds(31));
+        JobRun finished = service.getJobRun("etl", started.getId());
         assertEquals("SUCCEEDED", finished.getJobRunState());
-        assertEquals(T0.plusSeconds(60), finished.getCompletedOn());
+        assertEquals(started.getStartedOn().plusSeconds(60), finished.getCompletedOn());
         assertEquals(60, finished.getExecutionTime());
     }
 
@@ -142,13 +143,13 @@ class GlueJobRunServiceTest {
     void runLongerThanTheJobTimeoutEndsInTimeout() {
         createJob("etl", null, 1);
         GlueJobRunService service = service(120);
-        String runId = service.startJobRun("etl", null, new JobRun()).getId();
+        JobRun started = service.startJobRun("etl", null, new JobRun());
 
-        clock.set(T0.plusSeconds(61));
-        JobRun run = service.getJobRun("etl", runId);
+        clock.advance(Duration.ofSeconds(61));
+        JobRun run = service.getJobRun("etl", started.getId());
 
         assertEquals("TIMEOUT", run.getJobRunState());
-        assertEquals(T0.plusSeconds(60), run.getCompletedOn());
+        assertEquals(started.getStartedOn().plusSeconds(60), run.getCompletedOn());
         assertEquals(60, run.getExecutionTime());
     }
 
@@ -162,7 +163,7 @@ class GlueJobRunServiceTest {
                 () -> service.startJobRun("etl", null, new JobRun()));
         assertEquals("ConcurrentRunsExceededException", error.getErrorCode());
 
-        clock.set(T0.plusSeconds(60));
+        clock.advance(Duration.ofSeconds(60));
         assertEquals("RUNNING", service.startJobRun("etl", null, new JobRun()).getJobRunState());
     }
 
@@ -187,9 +188,9 @@ class GlueJobRunServiceTest {
         createJob("etl", 5, null);
         GlueJobRunService service = service(60);
         String finished = service.startJobRun("etl", null, new JobRun()).getId();
-        clock.set(T0.plusSeconds(60));
+        clock.advance(Duration.ofSeconds(60));
         String stillRunning = service.startJobRun("etl", null, new JobRun()).getId();
-        clock.set(T0.plusSeconds(70));
+        clock.advance(Duration.ofSeconds(10));
 
         GlueJobRunService.StopResult result =
                 service.batchStopJobRun("etl", List.of(stillRunning, finished, "jr_missing"));
@@ -209,7 +210,7 @@ class GlueJobRunServiceTest {
         createJob("etl", 10, null);
         GlueJobRunService service = service(0);
         String first = service.startJobRun("etl", null, new JobRun()).getId();
-        clock.set(T0.plusSeconds(1));
+        clock.advance(Duration.ofSeconds(1));
         String second = service.startJobRun("etl", null, new JobRun()).getId();
 
         GlueService.Page<JobRun> page = service.getJobRuns("etl", 1, null);
@@ -433,33 +434,6 @@ class GlueJobRunServiceTest {
                                                      String fileName,
                                                      TypeReference<Map<String, V>> typeReference) {
             return AccountAwareStorageBackend.inMemory(ACCOUNT_ID);
-        }
-    }
-
-    private static final class MutableClock extends Clock {
-        private Instant now;
-
-        private MutableClock(Instant now) {
-            this.now = now;
-        }
-
-        void set(Instant now) {
-            this.now = now;
-        }
-
-        @Override
-        public ZoneOffset getZone() {
-            return ZoneOffset.UTC;
-        }
-
-        @Override
-        public Clock withZone(ZoneId zone) {
-            return this;
-        }
-
-        @Override
-        public Instant instant() {
-            return now;
         }
     }
 }

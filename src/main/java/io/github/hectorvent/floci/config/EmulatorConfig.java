@@ -1961,6 +1961,10 @@ public interface EmulatorConfig {
         /** How long a job run stays RUNNING before it succeeds; 0 = a run succeeds as soon as it starts. */
         @WithDefault("0")
         int jobRunDurationSeconds();
+
+        /** How long a crawl keeps the crawler RUNNING before it succeeds; 0 = a crawl finishes as soon as it starts. */
+        @WithDefault("0")
+        int crawlerRunDurationSeconds();
     }
 
     interface SesServiceConfig {

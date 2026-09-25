@@ -48,6 +48,7 @@ class GlueJsonHandlerTest {
                 new KmsService(storageFactory, regionResolver));
         handler = new GlueJsonHandler(glueService,
                 new GlueJobRunService(new InMemoryStorage<>(), glueService, 0, Clock.systemUTC()),
+                new GlueCrawlerRunService(new InMemoryStorage<>(), glueService, 0, Clock.systemUTC()),
                 schemaRegistryService, mapper);
     }
 
@@ -874,5 +875,76 @@ class GlueJsonHandlerTest {
         assertEquals(1, got.get("Jobs").size());
         assertEquals("tagged", got.get("Jobs").get(0).get("Name").asText());
         assertEquals("absent", got.get("JobsNotFound").get(0).asText());
+    }
+
+    private void createCrawlerWithTags(String name, Map<String, String> tags) throws Exception {
+        ObjectNode create = mapper.createObjectNode();
+        create.put("Name", name);
+        create.put("Role", "arn:aws:iam::000000000000:role/glue");
+        create.putObject("Targets").putArray("S3Targets").addObject().put("Path", "s3://raw/" + name);
+        create.put("Schedule", "cron(0 2 * * ? *)");
+        ObjectNode tagNode = create.putObject("Tags");
+        tags.forEach(tagNode::put);
+        assertEquals(200, handler.handle("CreateCrawler", create, REGION).getStatus());
+    }
+
+    /**
+     * The crawl lifecycle as a client polls it: StartCrawler and StopCrawler answer with empty
+     * bodies, GetCrawler carries State and a LastCrawl with a numeric StartTime, and
+     * GetCrawlerMetrics reports numbers, never nulls.
+     */
+    @Test
+    void crawlerRunOperationsAnswerWithTheDocumentedBodies() throws Exception {
+        createCrawlerWithTags("raw", Map.of());
+        ObjectNode byName = mapper.createObjectNode().put("Name", "raw");
+
+        JsonNode before = mapper.valueToTree(handler.handle("GetCrawler", byName, REGION).getEntity()).get("Crawler");
+        assertEquals("READY", before.get("State").asText());
+
+        Response started = handler.handle("StartCrawler", byName, REGION);
+        assertEquals(0, mapper.valueToTree(started.getEntity()).size());
+
+        JsonNode crawler = mapper.valueToTree(handler.handle("GetCrawler", byName, REGION).getEntity()).get("Crawler");
+        assertEquals("READY", crawler.get("State").asText());
+        assertEquals("SUCCEEDED", crawler.get("LastCrawl").get("Status").asText());
+        assertTrue(crawler.get("LastCrawl").get("StartTime").isNumber());
+
+        AwsException idle = assertThrows(AwsException.class, () -> handler.handle("StopCrawler", byName, REGION));
+        assertEquals("CrawlerNotRunningException", idle.getErrorCode());
+
+        ObjectNode metricsRequest = mapper.createObjectNode();
+        metricsRequest.putArray("CrawlerNameList").add("raw");
+        JsonNode metrics = mapper.valueToTree(handler.handle("GetCrawlerMetrics", metricsRequest, REGION).getEntity())
+                .get("CrawlerMetricsList").get(0);
+        assertEquals("raw", metrics.get("CrawlerName").asText());
+        assertTrue(metrics.get("TimeLeftSeconds").isNumber());
+        assertTrue(metrics.get("MedianRuntimeSeconds").isNumber());
+        assertFalse(metrics.get("StillEstimating").asBoolean());
+
+        ObjectNode schedule = mapper.createObjectNode().put("CrawlerName", "raw");
+        assertEquals(0, mapper.valueToTree(handler.handle("StopCrawlerSchedule", schedule, REGION).getEntity()).size());
+        JsonNode stopped = mapper.valueToTree(handler.handle("GetCrawler", byName, REGION).getEntity()).get("Crawler");
+        assertEquals("NOT_SCHEDULED", stopped.get("Schedule").get("State").asText());
+    }
+
+    @Test
+    void listCrawlersFiltersOnTagsAndBatchGetCrawlersReportsMissingNames() throws Exception {
+        createCrawlerWithTags("tagged", Map.of("team", "data"));
+        createCrawlerWithTags("plain", Map.of());
+
+        JsonNode all = mapper.valueToTree(handler.handle("ListCrawlers", mapper.createObjectNode(), REGION).getEntity());
+        assertEquals(List.of("plain", "tagged"), mapper.convertValue(all.get("CrawlerNames"), List.class));
+
+        ObjectNode filtered = mapper.createObjectNode();
+        filtered.putObject("Tags").put("team", "data");
+        JsonNode byTag = mapper.valueToTree(handler.handle("ListCrawlers", filtered, REGION).getEntity());
+        assertEquals(List.of("tagged"), mapper.convertValue(byTag.get("CrawlerNames"), List.class));
+
+        ObjectNode batch = mapper.createObjectNode();
+        batch.putArray("CrawlerNames").add("tagged").add("absent");
+        JsonNode got = mapper.valueToTree(handler.handle("BatchGetCrawlers", batch, REGION).getEntity());
+        assertEquals("tagged", got.get("Crawlers").get(0).get("Name").asText());
+        assertEquals("READY", got.get("Crawlers").get(0).get("State").asText());
+        assertEquals("absent", got.get("CrawlersNotFound").get(0).asText());
     }
 }
