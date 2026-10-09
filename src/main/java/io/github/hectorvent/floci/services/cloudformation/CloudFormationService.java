@@ -1,5 +1,8 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
@@ -8,6 +11,9 @@ import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
+import io.github.hectorvent.floci.core.resource.ExplorerResource;
+import io.github.hectorvent.floci.core.resource.ResourceProvider;
+import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.cloudformation.model.ChangeSet;
@@ -22,9 +28,6 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.UpdateCle
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
 import io.github.hectorvent.floci.services.ssm.SsmService;
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -35,23 +38,20 @@ import java.net.URI;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.*;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Future;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
-import io.github.hectorvent.floci.core.resource.ExplorerResource;
-import io.github.hectorvent.floci.core.resource.ResourceProvider;
-import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -355,13 +355,13 @@ public class CloudFormationService implements ResourceProvider {
         // of throwing, so this failure is reported by the change set, not by a 400 on creation.
         String samTransformFailureReason = samTransformFailureReason(stackName, resolvedTemplate);
 
-        // Reject an unresolvable condition dependency graph up front, before any stack state is
+        // Reject an unresolvable or circular dependency graph up front, before any stack state is
         // created, so CreateStack/UpdateStack fail synchronously the way real CloudFormation does.
-        // Unconditional: validateConditionDependencies already returns immediately for any
+        // Unconditional: validateResourceDependencies already returns immediately for any
         // template declaring the SAM transform, whether or not that transform succeeded, so
         // gating this call on samTransformFailureReason == null duplicates that check for no
         // effect.
-        validateConditionDependencies(resolvedTemplate, parameters, region, accountId);
+        validateResourceDependencies(resolvedTemplate, parameters, region, accountId);
 
         // A CREATE change set against a name that already has a stack of any status - including
         // ROLLBACK_COMPLETE - is a real conflict: AWS requires an explicit DeleteStack before a
@@ -391,7 +391,7 @@ public class CloudFormationService implements ResourceProvider {
         // was already released, losing an accepted change set or corrupting the map's links. Only
         // persistStack() stays outside: it is storage I/O, and compute()'s contract is that the
         // remapping function does short, non-blocking work.
-        boolean isCreateType = changeSetType == null || "CREATE".equalsIgnoreCase(changeSetType);
+        boolean isCreateType = "CREATE".equalsIgnoreCase(changeSetType);
         // An update names its stack by name or stack ID; the map is keyed by name. One that names no
         // live stack is keyed as given, so it lands in the missing-stack branch below.
         Stack live = isCreateType ? null : resolveStack(stackName, region, accountId);
@@ -409,7 +409,6 @@ public class CloudFormationService implements ResourceProvider {
                 // matching stack-level event (as AWS and LocalStack do) so DescribeStackEvents is
                 // non-empty straight after change-set creation — tooling such as the AWS SAM CLI
                 // reads StackEvents[0] there and otherwise fails with an IndexError.
-                // (CreateChangeSet defaults a null type to CREATE.)
                 if (isCreateType) {
                     addEvent(target, target.getStackName(), target.getStackId(),
                             "AWS::CloudFormation::Stack", "REVIEW_IN_PROGRESS", "User Initiated");
@@ -445,7 +444,7 @@ public class CloudFormationService implements ResourceProvider {
             cs.setChangeSetName(changeSetName);
             cs.setStackName(canonicalStackName);
             cs.setStackId(target.getStackId());
-            cs.setChangeSetType(changeSetType != null ? changeSetType : "CREATE");
+            cs.setChangeSetType(changeSetType != null ? changeSetType : "UPDATE");
             cs.setTemplateBody(resolvedTemplate);
             cs.setParameters(parameters);
             cs.setCapabilities(capabilities);
@@ -498,7 +497,7 @@ public class CloudFormationService implements ResourceProvider {
         try {
             template = parseTemplate(templateBody);
         } catch (Exception e) {
-            // Template parse failures are reported by validateConditionDependencies and by
+            // Template parse failures are reported by validateResourceDependencies and by
             // execution itself, with their own messages; not this transform-specific one.
             return null;
         }
@@ -2326,7 +2325,9 @@ public class CloudFormationService implements ResourceProvider {
             }
             Map<String, Boolean> conditions = resolveConditions(
                     template, stack.parametersSnapshot(), stack, region, regionResolver.getAccountId());
-            List<String> creationOrder = topologicalSort(resources, conditions);
+            // A stack saved before circular templates were rejected may still have one; order it
+            // by its dependencies anyway rather than giving up.
+            List<String> creationOrder = creationOrder(resources, conditions).sorted();
             Map<String, Integer> rank = new HashMap<>();
             for (int i = 0; i < creationOrder.size(); i++) {
                 rank.put(creationOrder.get(i), i);
@@ -2506,16 +2507,17 @@ public class CloudFormationService implements ResourceProvider {
 
     /**
      * Fails a create/update before any stack state is mutated when a resource that will be created
-     * depends on a resource excluded by a false condition. Real CloudFormation rejects such a
-     * template synchronously ("Template format error: Unresolved resource dependencies [...]")
-     * rather than silently skipping the dependent, so mirror that instead of dropping the resource.
+     * depends on a resource excluded by a false condition, or when resources depend on each other
+     * in a cycle. Real CloudFormation rejects such a template synchronously ("Template format
+     * error: Unresolved resource dependencies [...]" or "Circular dependency between resources:
+     * [...]") rather than skipping the dependent or picking an arbitrary order, so mirror that.
      * Malformed or SAM templates are left for the execution path, which surfaces their own errors.
      * A template carrying an unexpanded {@code Fn::Transform}/{@code AWS::Include} is left for the
      * same reason: a {@code Conditions} section spliced in from a snippet is invisible here, since
      * the merge has not run yet, and treating it as absent would fail a template whose dependency
      * graph the execution path resolves correctly.
      */
-    private void validateConditionDependencies(String templateBody, Map<String, String> params,
+    private void validateResourceDependencies(String templateBody, Map<String, String> params,
                                                String region, String accountId) {
         JsonNode template;
         try {
@@ -2537,23 +2539,8 @@ public class CloudFormationService implements ResourceProvider {
         Map<String, Boolean> conditions =
                 resolveConditions(template, resolvedParams, null, region, accountId);
 
-        Set<String> allIds = new LinkedHashSet<>();
-        resources.fieldNames().forEachRemaining(allIds::add);
-        Set<String> activeIds = new LinkedHashSet<>();
-        Map<String, Set<String>> dependencies = new HashMap<>();
-        for (String logicalId : allIds) {
-            JsonNode resDef = resources.get(logicalId);
-            String condition = resDef.path("Condition").asText(null);
-            if (condition == null || conditions.getOrDefault(condition, false)) {
-                activeIds.add(logicalId);
-            }
-            dependencies.put(logicalId, collectResourceDependencies(resDef, allIds, conditions));
-        }
-
-        Set<String> unresolved = unresolvedConditionDependencies(activeIds, allIds, dependencies);
-        if (!unresolved.isEmpty()) {
-            throw unresolvedDependenciesError(unresolved);
-        }
+        // Throws the ValidationError for either case; the order itself is computed again on execution.
+        topologicalSort(resources, conditions);
     }
 
     private boolean evaluateCondition(JsonNode expr, Map<String, String> params,
@@ -3069,6 +3056,25 @@ public class CloudFormationService implements ResourceProvider {
     }
 
     private List<String> topologicalSort(JsonNode resources, Map<String, Boolean> conditions) {
+        // A resource left unsorted is in a dependency cycle or depends on one, so no creation
+        // order exists; AWS rejects such a template instead of creating it in an arbitrary order.
+        CreationOrder order = creationOrder(resources, conditions);
+        if (!order.circular().isEmpty()) {
+            throw new AwsException("ValidationError",
+                    "Circular dependency between resources: [" + String.join(", ", order.circular()) + "]", 400);
+        }
+        return order.sorted();
+    }
+
+    /**
+     * The template's resources, dependencies first, and those in a dependency cycle. Resources in or
+     * depending on a cycle are still placed in {@code sorted}, each cycle after the cycles it depends
+     * on, so every dependency outside a cycle keeps its order.
+     */
+    private record CreationOrder(List<String> sorted, Set<String> circular) {
+    }
+
+    private CreationOrder creationOrder(JsonNode resources, Map<String, Boolean> conditions) {
         Set<String> allIds = new LinkedHashSet<>();
         resources.fieldNames().forEachRemaining(allIds::add);
 
@@ -3128,13 +3134,81 @@ public class CloudFormationService implements ResourceProvider {
             }
         }
 
-        for (String id : activeIds) {
-            if (!sorted.contains(id)) {
-                sorted.add(id);
+        // Every resource left waits on another one left. Ordering their strongly connected
+        // components dependencies first still respects every dependency outside a cycle; only the
+        // components that are cycles themselves are circular.
+        Set<String> circular = new LinkedHashSet<>();
+        if (sorted.size() < activeIds.size()) {
+            Set<String> placed = new HashSet<>(sorted);
+            for (List<String> component : componentsDependenciesFirst(activeIds, placed, dependencies)) {
+                sorted.addAll(component);
+                String first = component.get(0);
+                if (component.size() > 1 || dependencies.get(first).contains(first)) {
+                    circular.addAll(component);
+                }
             }
         }
+        return new CreationOrder(sorted, circular);
+    }
 
-        return sorted;
+    /**
+     * The strongly connected components of the resources not yet placed, each after every component
+     * it depends on: Tarjan's algorithm completes a component only once those are complete. The
+     * search keeps its own stack so a long dependency chain cannot exhaust the thread's.
+     */
+    private static List<List<String>> componentsDependenciesFirst(Set<String> activeIds, Set<String> placed,
+                                                                  Map<String, Set<String>> dependencies) {
+        Map<String, Integer> index = new HashMap<>();
+        Map<String, Integer> lowLink = new HashMap<>();
+        Deque<String> open = new ArrayDeque<>();
+        Set<String> onOpen = new HashSet<>();
+        List<List<String>> components = new ArrayList<>();
+        Deque<Map.Entry<String, Iterator<String>>> path = new ArrayDeque<>();
+        for (String root : activeIds) {
+            if (placed.contains(root) || index.containsKey(root)) {
+                continue;
+            }
+            String next = root;
+            while (next != null || !path.isEmpty()) {
+                if (next != null) {
+                    index.put(next, index.size());
+                    lowLink.put(next, index.get(next));
+                    open.push(next);
+                    onOpen.add(next);
+                    path.push(Map.entry(next, dependencies.get(next).iterator()));
+                    next = null;
+                }
+                String id = path.peek().getKey();
+                Iterator<String> deps = path.peek().getValue();
+                if (deps.hasNext()) {
+                    String dep = deps.next();
+                    if (!dependencies.containsKey(dep) || placed.contains(dep)) {
+                        continue;
+                    }
+                    if (!index.containsKey(dep)) {
+                        next = dep;
+                    } else if (onOpen.contains(dep)) {
+                        lowLink.merge(id, index.get(dep), Math::min);
+                    }
+                    continue;
+                }
+                path.pop();
+                if (!path.isEmpty()) {
+                    lowLink.merge(path.peek().getKey(), lowLink.get(id), Math::min);
+                }
+                if (lowLink.get(id).equals(index.get(id))) {
+                    List<String> component = new ArrayList<>();
+                    String member;
+                    do {
+                        member = open.pop();
+                        onOpen.remove(member);
+                        component.add(member);
+                    } while (!member.equals(id));
+                    components.add(component);
+                }
+            }
+        }
+        return components;
     }
 
     private static final Pattern SUB_VAR_PATTERN = Pattern.compile("\\$\\{([^}]+)}");

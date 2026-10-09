@@ -17,11 +17,13 @@ import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.ssm.SsmService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.InOrder;
 
 import java.time.Clock;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -31,6 +33,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -192,6 +195,161 @@ class CloudFormationServiceRollbackTest {
                     : "Stack with id " + nameOrId + " does not exist", error.getMessage());
         }
         assertEquals(Set.of("create"), stack.getChangeSets().keySet());
+    }
+
+    @Test
+    void deleteStack_savedWithCircularTemplate_stillDeletesDependentsFirst() {
+        // A stack saved before circular templates were rejected: the queues depend on each other,
+        // and the target group was added by a later update, so it sits after the listener using it.
+        Stack stack = new Stack();
+        stack.setStackName("delete-saved-circular-stack");
+        stack.setStackId("stack-id");
+        stack.setRegion(REGION);
+        stack.setStatus("UPDATE_COMPLETE");
+        stack.setTemplateBody("""
+                {"Resources": {
+                  "FirstQueue": {"Type": "AWS::SQS::Queue", "DependsOn": "SecondQueue"},
+                  "SecondQueue": {"Type": "AWS::SQS::Queue", "DependsOn": "FirstQueue"},
+                  "TargetGroup": {"Type": "AWS::ElasticLoadBalancingV2::TargetGroup"},
+                  "Listener": {"Type": "AWS::ElasticLoadBalancingV2::Listener",
+                               "Properties": {"DefaultActions": [{"Type": "forward",
+                                   "TargetGroupArn": {"Ref": "TargetGroup"}}]}}
+                }}""");
+        StackResource listener = resource("Listener", "listener-arn", "AWS::ElasticLoadBalancingV2::Listener",
+                "CREATE_COMPLETE");
+        StackResource firstQueue = resource("FirstQueue", "first-url", "AWS::SQS::Queue", "CREATE_COMPLETE");
+        StackResource secondQueue = resource("SecondQueue", "second-url", "AWS::SQS::Queue", "CREATE_COMPLETE");
+        StackResource targetGroup = resource("TargetGroup", "target-group-arn",
+                "AWS::ElasticLoadBalancingV2::TargetGroup", "CREATE_COMPLETE");
+        for (StackResource resource : new StackResource[] {listener, firstQueue, secondQueue, targetGroup}) {
+            stack.getResources().put(resource.getLogicalId(), resource);
+        }
+        when(provisioner.completeUpdate(any())).thenReturn(UpdateCleanupResult.notApplicable());
+
+        service.deleteStackResources(stack, REGION, ACCOUNT);
+
+        InOrder deletes = inOrder(provisioner);
+        deletes.verify(provisioner).delete(listener, REGION);
+        deletes.verify(provisioner).delete(targetGroup, REGION);
+        assertEquals("DELETE_COMPLETE", stack.getStatus());
+    }
+
+    @Test
+    void deleteStack_savedWithCircularTemplate_deletesResourcesDependingOnTheCycleInDependencyOrder() {
+        // The target group depends on a queue in the cycle, so it cannot be ordered either; the
+        // listener using it comes first in the template, yet must still be deleted first.
+        Stack stack = new Stack();
+        stack.setStackName("delete-saved-circular-chain");
+        stack.setStackId("stack-id");
+        stack.setRegion(REGION);
+        stack.setStatus("UPDATE_COMPLETE");
+        stack.setTemplateBody("""
+                {"Resources": {
+                  "Listener": {"Type": "AWS::ElasticLoadBalancingV2::Listener",
+                               "Properties": {"DefaultActions": [{"Type": "forward",
+                                   "TargetGroupArn": {"Ref": "TargetGroup"}}]}},
+                  "FirstQueue": {"Type": "AWS::SQS::Queue", "DependsOn": "SecondQueue"},
+                  "SecondQueue": {"Type": "AWS::SQS::Queue", "DependsOn": "FirstQueue"},
+                  "TargetGroup": {"Type": "AWS::ElasticLoadBalancingV2::TargetGroup", "DependsOn": "FirstQueue"}
+                }}""");
+        StackResource listener = resource("Listener", "listener-arn", "AWS::ElasticLoadBalancingV2::Listener",
+                "CREATE_COMPLETE");
+        StackResource firstQueue = resource("FirstQueue", "first-url", "AWS::SQS::Queue", "CREATE_COMPLETE");
+        StackResource secondQueue = resource("SecondQueue", "second-url", "AWS::SQS::Queue", "CREATE_COMPLETE");
+        StackResource targetGroup = resource("TargetGroup", "target-group-arn",
+                "AWS::ElasticLoadBalancingV2::TargetGroup", "CREATE_COMPLETE");
+        for (StackResource resource : new StackResource[] {listener, firstQueue, secondQueue, targetGroup}) {
+            stack.getResources().put(resource.getLogicalId(), resource);
+        }
+        when(provisioner.completeUpdate(any())).thenReturn(UpdateCleanupResult.notApplicable());
+
+        service.deleteStackResources(stack, REGION, ACCOUNT);
+
+        InOrder deletes = inOrder(provisioner);
+        deletes.verify(provisioner).delete(listener, REGION);
+        deletes.verify(provisioner).delete(targetGroup, REGION);
+        deletes.verify(provisioner).delete(firstQueue, REGION);
+        assertEquals("DELETE_COMPLETE", stack.getStatus());
+    }
+
+    @Test
+    void deleteStack_savedWithLinkedCircularTemplates_deletesTheDependentCycleFirst() {
+        // Two cycles, the consumer's cycle also depending on the queues' cycle: the consumer must
+        // be deleted while the queues it uses still exist.
+        Stack stack = new Stack();
+        stack.setStackName("delete-saved-linked-cycles");
+        stack.setStackId("stack-id");
+        stack.setRegion(REGION);
+        stack.setStatus("UPDATE_COMPLETE");
+        stack.setTemplateBody("""
+                {"Resources": {
+                  "Consumer": {"Type": "AWS::SQS::Queue", "DependsOn": ["Partner", "FirstQueue"]},
+                  "Partner": {"Type": "AWS::SQS::Queue", "DependsOn": "Consumer"},
+                  "FirstQueue": {"Type": "AWS::SQS::Queue", "DependsOn": "SecondQueue"},
+                  "SecondQueue": {"Type": "AWS::SQS::Queue", "DependsOn": "FirstQueue"}
+                }}""");
+        StackResource consumer = resource("Consumer", "consumer-url", "AWS::SQS::Queue", "CREATE_COMPLETE");
+        StackResource partner = resource("Partner", "partner-url", "AWS::SQS::Queue", "CREATE_COMPLETE");
+        StackResource firstQueue = resource("FirstQueue", "first-url", "AWS::SQS::Queue", "CREATE_COMPLETE");
+        StackResource secondQueue = resource("SecondQueue", "second-url", "AWS::SQS::Queue", "CREATE_COMPLETE");
+        for (StackResource resource : new StackResource[] {consumer, partner, firstQueue, secondQueue}) {
+            stack.getResources().put(resource.getLogicalId(), resource);
+        }
+        when(provisioner.completeUpdate(any())).thenReturn(UpdateCleanupResult.notApplicable());
+
+        service.deleteStackResources(stack, REGION, ACCOUNT);
+
+        InOrder deletes = inOrder(provisioner);
+        deletes.verify(provisioner).delete(consumer, REGION);
+        deletes.verify(provisioner).delete(firstQueue, REGION);
+        assertEquals("DELETE_COMPLETE", stack.getStatus());
+    }
+
+    @Test
+    void deleteStack_savedWithLongChainIntoCycle_deletesWithoutExhaustingTheThreadStack() throws InterruptedException {
+        // Each resource depends on the next and the last one on a cycle, so finding the cycle has
+        // to follow the whole chain; a small thread stack makes a recursive search overflow.
+        int chainLength = 5_000;
+        StringBuilder resources = new StringBuilder();
+        Stack stack = new Stack();
+        stack.setStackName("delete-saved-long-chain");
+        stack.setStackId("stack-id");
+        stack.setRegion(REGION);
+        stack.setStatus("UPDATE_COMPLETE");
+        StackResource[] chain = new StackResource[chainLength];
+        for (int i = 0; i < chainLength; i++) {
+            String next = i + 1 < chainLength ? "Link" + (i + 1) : "FirstQueue";
+            resources.append("\"Link").append(i).append("\": {\"Type\": \"AWS::SQS::Queue\", \"DependsOn\": \"")
+                    .append(next).append("\"},");
+            chain[i] = resource("Link" + i, "link-" + i, "AWS::SQS::Queue", "CREATE_COMPLETE");
+            stack.getResources().put(chain[i].getLogicalId(), chain[i]);
+        }
+        stack.setTemplateBody("{\"Resources\": {" + resources
+                + "\"FirstQueue\": {\"Type\": \"AWS::SQS::Queue\", \"DependsOn\": \"SecondQueue\"},"
+                + "\"SecondQueue\": {\"Type\": \"AWS::SQS::Queue\", \"DependsOn\": \"FirstQueue\"}}}");
+        StackResource firstQueue = resource("FirstQueue", "first-url", "AWS::SQS::Queue", "CREATE_COMPLETE");
+        StackResource secondQueue = resource("SecondQueue", "second-url", "AWS::SQS::Queue", "CREATE_COMPLETE");
+        stack.getResources().put(firstQueue.getLogicalId(), firstQueue);
+        stack.getResources().put(secondQueue.getLogicalId(), secondQueue);
+        when(provisioner.completeUpdate(any())).thenReturn(UpdateCleanupResult.notApplicable());
+
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread deleter = new Thread(null, () -> {
+            try {
+                service.deleteStackResources(stack, REGION, ACCOUNT);
+            } catch (Throwable t) {
+                failure.set(t);
+            }
+        }, "small-stack-delete", 256 * 1024);
+        deleter.start();
+        deleter.join();
+
+        assertNull(failure.get());
+        assertEquals("DELETE_COMPLETE", stack.getStatus());
+        InOrder deletes = inOrder(provisioner);
+        deletes.verify(provisioner).delete(chain[0], REGION);
+        deletes.verify(provisioner).delete(chain[chainLength - 1], REGION);
+        deletes.verify(provisioner).delete(firstQueue, REGION);
     }
 
     private static StackResource resource(String logicalId, String physicalId, String resourceType, String status) {
