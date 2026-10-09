@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.testing.ValidateSignaturesProfile;
 import io.github.hectorvent.floci.testutil.AwsRequestSigner;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
+import io.restassured.RestAssured;
 import io.restassured.path.xml.XmlPath;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
@@ -12,13 +13,21 @@ import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Map;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.startsWith;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * {@code floci.auth.validate-signatures} authenticates every header-signed request, not only S3's:
@@ -280,6 +289,125 @@ class SigV4HeaderSignatureIntegrationTest {
 
     @Test
     @Order(12)
+    void credentialScopeNamingAnotherVerifiersServiceIsStillVerified() {
+        // Which verifier owns a request is decided by the resource it matched, not by the service
+        // the caller wrote into its own credential scope.
+        for (String scopeService : new String[]{"s3", "s3express", "execute-api"}) {
+            given()
+                .filter(AwsRequestSigner.signedAs("test", "not-the-secret", scopeService))
+                .contentType(JSON_1_0)
+                .header("X-Amz-Target", "AmazonSQS.ListQueues")
+                .body("{}")
+            .when()
+                .post("/")
+            .then()
+                .statusCode(403)
+                .body("__type", equalTo("InvalidSignatureException"));
+        }
+    }
+
+    @Test
+    @Order(13)
+    void s3ControlIsVerifiedAndAnswersInXml() {
+        given()
+            .filter(AwsRequestSigner.signedAs("test", "test", "s3"))
+            .header("x-amz-account-id", "000000000000")
+        .when()
+            .get("/v20180820/accesspoint")
+        .then()
+            .statusCode(200);
+
+        given()
+            .filter(AwsRequestSigner.signedAs("test", "not-the-secret", "s3"))
+            .header("x-amz-account-id", "000000000000")
+        .when()
+            .get("/v20180820/accesspoint")
+        .then()
+            .statusCode(403)
+            .contentType(containsString("xml"))
+            .body("ErrorResponse.Error.Code", equalTo("SignatureDoesNotMatch"));
+    }
+
+    @Test
+    @Order(14)
+    void restXmlServiceAnswersInXml() {
+        given()
+            .filter(AwsRequestSigner.signedAs("test", "test", "route53"))
+        .when()
+            .get("/2013-04-01/hostedzone")
+        .then()
+            .statusCode(200);
+
+        given()
+            .filter(AwsRequestSigner.signedAs("test", "not-the-secret", "route53"))
+        .when()
+            .get("/2013-04-01/hostedzone")
+        .then()
+            .statusCode(403)
+            .contentType(containsString("xml"))
+            .body("ErrorResponse.Error.Code", equalTo("SignatureDoesNotMatch"));
+
+        given()
+            .filter(AwsRequestSigner.signedAs("AKIAUNKNOWNACCESSKEY", "some-secret", "route53"))
+        .when()
+            .get("/2013-04-01/hostedzone")
+        .then()
+            .statusCode(403)
+            .body("ErrorResponse.Error.Code", equalTo("InvalidClientTokenId"));
+    }
+
+    @Test
+    @Order(15)
+    void clientSuppliedOriginalContentTypeCannotStandInForTheSignedOne() throws Exception {
+        // Signed over one Content-Type, sent with another plus Floci's internal header claiming the
+        // signed value. A raw client keeps both headers exactly as written. The internal header is
+        // stripped on the way in, so the swap is a mismatch rather than a verified request.
+        URI uri = URI.create("http://localhost:" + RestAssured.port + "/");
+        byte[] body = "{}".getBytes(StandardCharsets.UTF_8);
+        Map<String, String> auth = AwsRequestSigner.signedAs("test", "test", "sqs").headersFor("POST", uri,
+                Map.of("content-type", JSON_1_0, "x-amz-target", "AmazonSQS.ListQueues"), body);
+
+        assertEquals(200, sendSqsListQueues(uri, auth, JSON_1_0, null, body).statusCode());
+
+        HttpResponse<String> swapped = sendSqsListQueues(uri, auth, JSON_1_0 + "; charset=utf-8", JSON_1_0, body);
+        assertEquals(403, swapped.statusCode());
+        assertTrue(swapped.body().contains("InvalidSignatureException"), swapped.body());
+    }
+
+    @Test
+    @Order(16)
+    void executeApiRoutesAreLeftToTheirOwnAuthorizer() {
+        // A wrong secret on an execute-api path is ExecuteApiSigV4Authorizer's call, per method:
+        // here the API does not exist, so the answer is the controller's 404, not this filter's 403.
+        for (String path : new String[]{"/execute-api/nope/stage/x", "/_aws/execute-api/nope/stage/x",
+                "/restapis/nope/stage/_user_request_/x"}) {
+            given()
+                .filter(AwsRequestSigner.signedAs("test", "not-the-secret", "execute-api"))
+            .when()
+                .get(path)
+            .then()
+                .statusCode(404);
+        }
+    }
+
+    private static HttpResponse<String> sendSqsListQueues(URI uri, Map<String, String> auth, String contentType,
+                                                         String claimedOriginal, byte[] body) throws Exception {
+        HttpRequest.Builder request = HttpRequest.newBuilder(uri)
+                .version(HttpClient.Version.HTTP_1_1)
+                .POST(HttpRequest.BodyPublishers.ofByteArray(body))
+                .header("Content-Type", contentType)
+                .header("X-Amz-Target", "AmazonSQS.ListQueues");
+        auth.forEach(request::header);
+        if (claimedOriginal != null) {
+            request.header(AwsCborContentTypeFilter.ORIGINAL_CONTENT_TYPE_HEADER, claimedOriginal);
+        }
+        try (HttpClient client = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build()) {
+            return client.send(request.build(), HttpResponse.BodyHandlers.ofString());
+        }
+    }
+
+    @Test
+    @Order(17)
     void unsignedRequestIsLeftToIamEnforcement() {
         given()
             .contentType(JSON_1_0)

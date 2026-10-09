@@ -1,5 +1,7 @@
 package io.github.hectorvent.floci.core.common;
 
+import io.github.hectorvent.floci.core.common.auth.CredentialScope;
+import io.github.hectorvent.floci.core.common.auth.SigV4Canonicalization;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
@@ -97,11 +99,11 @@ class SigV4HeaderSignatureFilterTest {
 
     @Test
     void canonicalUriKeepsThePlainPathWhenNothingIsEscaped() {
-        assertEquals(List.of("/"), SigV4HeaderSignatureFilter.canonicalUriCandidates(""));
+        assertEquals(List.of("/"), SigV4Canonicalization.canonicalUriCandidates(""));
         assertEquals(List.of("/schedule-groups/default"),
-                SigV4HeaderSignatureFilter.canonicalUriCandidates("/schedule-groups/default"));
-        assertEquals(List.of("/functions/a%253Ab", "/functions/a%3Ab"),
-                SigV4HeaderSignatureFilter.canonicalUriCandidates("/functions/a%3Ab"));
+                SigV4Canonicalization.canonicalUriCandidates("/schedule-groups/default"));
+        assertEquals(List.of("/functions/a%3Ab", "/functions/a%253Ab"),
+                SigV4Canonicalization.canonicalUriCandidates("/functions/a%3Ab"));
     }
 
     private static boolean matches(String method, String rawPath, String rawQuery, String signedHeaders,
@@ -113,6 +115,7 @@ class SigV4HeaderSignatureFilterTest {
                     case "x-amz-date" -> AMZ_DATE;
                     default -> headers.get(name);
                 },
-                body.getBytes(StandardCharsets.UTF_8), secret, AMZ_DATE, SCOPE_DATE, REGION, service, signature);
+                body.getBytes(StandardCharsets.UTF_8), secret, AMZ_DATE,
+                new CredentialScope("AKIDEXAMPLE", SCOPE_DATE, REGION, service), signature);
     }
 }

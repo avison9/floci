@@ -1,21 +1,20 @@
 package io.github.hectorvent.floci.testutil;
 
+import io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator;
 import io.restassured.filter.Filter;
 import io.restassured.filter.FilterContext;
 import io.restassured.response.Response;
 import io.restassured.specification.FilterableRequestSpecification;
 import io.restassured.specification.FilterableResponseSpecification;
 
-import javax.crypto.Mac;
-import javax.crypto.spec.SecretKeySpec;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.TreeMap;
 import java.util.stream.Collectors;
 
 /**
@@ -83,51 +82,63 @@ public final class AwsRequestSigner implements Filter {
     }
 
     private void sign(FilterableRequestSpecification request) throws Exception {
-        URI uri = URI.create(request.getURI());
+        Map<String, String> signed = new LinkedHashMap<>();
+        if (signContentType) {
+            signed.put("content-type", request.getContentType());
+        }
+        String target = request.getHeaders().getValue("X-Amz-Target");
+        if (target != null) {
+            signed.put("x-amz-target", target);
+        }
+        headersFor(request.getMethod(), URI.create(request.getURI()), signed, bodyBytes(request.getBody()))
+                .forEach(request::header);
+    }
+
+    /**
+     * The headers a signed request must carry ({@code X-Amz-Date}, {@code Authorization} and, with a
+     * session token, {@code X-Amz-Security-Token}), for tests that send with a client other than
+     * RestAssured. {@code host}, {@code x-amz-date} and the token are always signed; {@code extra}
+     * names any further headers to sign, by lowercase name, with the values the request will carry.
+     */
+    public Map<String, String> headersFor(String method, URI uri, Map<String, String> extra, byte[] body)
+            throws Exception {
         String amzDate = AMZ_DATE.format(signedAt != null ? signedAt : Instant.now());
         String scopeDate = amzDate.substring(0, 8);
         String host = uri.getPort() > 0 && uri.getPort() != 80 && uri.getPort() != 443
                 ? uri.getHost() + ":" + uri.getPort()
                 : uri.getHost();
 
-        List<String[]> headers = new ArrayList<>();
-        if (signContentType) {
-            headers.add(new String[]{"content-type", request.getContentType()});
-        }
-        headers.add(new String[]{"host", host});
-        headers.add(new String[]{"x-amz-date", amzDate});
+        TreeMap<String, String> headers = new TreeMap<>(extra);
+        headers.put("host", host);
+        headers.put("x-amz-date", amzDate);
         if (sessionToken != null) {
-            headers.add(new String[]{"x-amz-security-token", sessionToken});
+            headers.put("x-amz-security-token", sessionToken);
         }
-        String target = request.getHeaders().getValue("X-Amz-Target");
-        if (target != null) {
-            headers.add(new String[]{"x-amz-target", target});
-        }
-        String signedHeaders = headers.stream().map(h -> h[0]).collect(Collectors.joining(";"));
-        String canonicalHeaders = headers.stream().map(h -> h[0] + ":" + h[1] + "\n").collect(Collectors.joining());
+        String signedHeaders = String.join(";", headers.keySet());
+        String canonicalHeaders = headers.entrySet().stream()
+                .map(h -> h.getKey() + ":" + h.getValue() + "\n")
+                .collect(Collectors.joining());
 
-        String canonicalRequest = request.getMethod() + "\n"
+        String canonicalRequest = method + "\n"
                 + doubleEncodedPath(uri.getRawPath()) + "\n"
                 + S3RequestSigner.canonicalQueryString(uri.getRawQuery()) + "\n"
                 + canonicalHeaders + "\n"
                 + signedHeaders + "\n"
-                + sha256Hex(bodyBytes(request.getBody()));
+                + SigV4RequestValidator.sha256Hex(body);
         String credentialScope = scopeDate + "/us-east-1/" + service + "/aws4_request";
         String stringToSign = ALGORITHM + "\n" + amzDate + "\n" + credentialScope + "\n"
-                + sha256Hex(canonicalRequest.getBytes(StandardCharsets.UTF_8));
+                + SigV4RequestValidator.sha256Hex(canonicalRequest.getBytes(StandardCharsets.UTF_8));
+        byte[] signingKey = SigV4RequestValidator.deriveSigningKey(secretKey, scopeDate, "us-east-1", service);
+        String signature = SigV4RequestValidator.hexEncode(SigV4RequestValidator.hmacSha256(signingKey, stringToSign));
 
-        byte[] key = hmacSha256(("AWS4" + secretKey).getBytes(StandardCharsets.UTF_8), scopeDate);
-        key = hmacSha256(key, "us-east-1");
-        key = hmacSha256(key, service);
-        key = hmacSha256(key, "aws4_request");
-        String signature = hexEncode(hmacSha256(key, stringToSign));
-
-        request.header("X-Amz-Date", amzDate);
+        Map<String, String> result = new LinkedHashMap<>();
+        result.put("X-Amz-Date", amzDate);
         if (sessionToken != null) {
-            request.header("X-Amz-Security-Token", sessionToken);
+            result.put("X-Amz-Security-Token", sessionToken);
         }
-        request.header("Authorization", ALGORITHM + " Credential=" + accessKeyId + "/" + credentialScope
+        result.put("Authorization", ALGORITHM + " Credential=" + accessKeyId + "/" + credentialScope
                 + ", SignedHeaders=" + signedHeaders + ", Signature=" + signature);
+        return result;
     }
 
     private static String doubleEncodedPath(String rawPath) {
@@ -154,23 +165,5 @@ public final class AwsRequestSigner implements Filter {
             return text.getBytes(StandardCharsets.UTF_8);
         }
         throw new IllegalArgumentException("unsupported body type " + body.getClass().getName());
-    }
-
-    private static byte[] hmacSha256(byte[] key, String data) throws Exception {
-        Mac mac = Mac.getInstance("HmacSHA256");
-        mac.init(new SecretKeySpec(key, "HmacSHA256"));
-        return mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
-    }
-
-    private static String sha256Hex(byte[] input) throws Exception {
-        return hexEncode(MessageDigest.getInstance("SHA-256").digest(input));
-    }
-
-    private static String hexEncode(byte[] bytes) {
-        StringBuilder hex = new StringBuilder(bytes.length * 2);
-        for (byte b : bytes) {
-            hex.append(String.format("%02x", b));
-        }
-        return hex.toString();
     }
 }
