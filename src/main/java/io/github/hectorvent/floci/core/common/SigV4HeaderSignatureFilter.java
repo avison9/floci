@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayAwsExecuteController;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayExecuteController;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayUserRequestController;
+import io.github.hectorvent.floci.services.appsync.graphql.AppSyncExecutionController;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.s3.S3ControlController;
 import io.github.hectorvent.floci.services.s3.S3Controller;
@@ -67,8 +68,10 @@ import java.util.function.UnaryOperator;
  *
  * <p>Which requests another verifier owns is decided by the resource the request matched, never by
  * the service the caller's own credential scope names: a request for {@link S3Controller} goes
- * through {@code S3HeaderSignatureFilter}, and one for the API Gateway execute controllers through
- * {@code ExecuteApiSigV4Authorizer}, which decides per method whether IAM auth applies at all.
+ * through {@code S3HeaderSignatureFilter}, one for the API Gateway execute controllers through
+ * {@code ExecuteApiSigV4Authorizer}, which decides per method whether IAM auth applies at all, and
+ * one for {@code AppSyncExecutionController} (GraphQL) through AppSync's {@code IamAuthValidator},
+ * which answers in the {@code UnauthorizedException} envelope AppSync clients parse.
  * Everything else is verified here, S3 Control included, whatever service its scope names.
  *
  * <p>As with S3, signature verification is authentication only, and an unsigned request is let
@@ -99,7 +102,7 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
     /** Resources whose signatures another verifier owns; see the class comment. */
     private static final Set<Class<?>> VERIFIED_ELSEWHERE = Set.of(S3Controller.class,
             ApiGatewayExecuteController.class, ApiGatewayAwsExecuteController.class,
-            ApiGatewayUserRequestController.class);
+            ApiGatewayUserRequestController.class, AppSyncExecutionController.class);
 
     /** REST-XML resources the catalog does not list: S3 Control answers in S3's XML. */
     private static final Set<Class<?>> UNCATALOGUED_REST_XML = Set.of(S3ControlController.class);

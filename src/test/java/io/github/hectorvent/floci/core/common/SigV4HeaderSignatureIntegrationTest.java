@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.core.common;
 
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.github.hectorvent.floci.testing.ValidateSignaturesProfile;
+import io.github.hectorvent.floci.testutil.AppSyncRequestSigner;
 import io.github.hectorvent.floci.testutil.AwsRequestSigner;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
@@ -390,6 +391,36 @@ class SigV4HeaderSignatureIntegrationTest {
         }
     }
 
+    @Test
+    @Order(17)
+    void appSyncGraphqlIsLeftToItsOwnIamCheck() throws Exception {
+        // The management plane is verified here like any other service; the GraphQL endpoint is
+        // AppSync's own, and a wrong secret there gets AppSync's UnauthorizedException envelope.
+        String apiId = given()
+            .filter(AwsRequestSigner.signedAs("test", "test", "appsync"))
+            .contentType("application/json")
+            .body("{\"name\": \"validate-signatures-graphql\", \"authenticationType\": \"AWS_IAM\"}")
+        .when()
+            .post("/v1/apis")
+        .then()
+            .statusCode(200)
+            .extract().path("graphqlApi.apiId");
+
+        String query = "{\"query\": \"{ __typename }\"}";
+        Map<String, String> forged = AppSyncRequestSigner.signedHeaders(apiId, "localhost:" + RestAssured.port,
+                query, "test", "not-the-secret", "us-east-1", Instant.now());
+        given()
+            .headers(forged)
+            .contentType("application/json")
+            .body(query)
+        .when()
+            .post("/v1/apis/" + apiId + "/graphql")
+        .then()
+            .statusCode(401)
+            .header("x-amzn-errortype", containsString("UnauthorizedException"))
+            .body("errors[0].errorType", equalTo("UnauthorizedException"));
+    }
+
     private static HttpResponse<String> sendSqsListQueues(URI uri, Map<String, String> auth, String contentType,
                                                          String claimedOriginal, byte[] body) throws Exception {
         HttpRequest.Builder request = HttpRequest.newBuilder(uri)
@@ -407,7 +438,7 @@ class SigV4HeaderSignatureIntegrationTest {
     }
 
     @Test
-    @Order(17)
+    @Order(18)
     void unsignedRequestIsLeftToIamEnforcement() {
         given()
             .contentType(JSON_1_0)
