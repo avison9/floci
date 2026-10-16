@@ -8,6 +8,8 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -20,7 +22,7 @@ class EcrLayerUploadsTest {
 
     @Test
     void aPartMustStartAtTheNextByteAndMatchItsRange() {
-        EcrLayerUploads uploads = new EcrLayerUploads();
+        EcrLayerUploads uploads = new EcrLayerUploads(location -> { });
         EcrLayerUploads.Session session = uploads.require(SCOPE, uploads.open(SCOPE, "http://r/u1"), "app");
 
         assertDoesNotThrow(() -> check(session, 0, 9, 10));
@@ -42,7 +44,7 @@ class EcrLayerUploadsTest {
 
     @Test
     void aPartOver20MiBIsRefused() {
-        EcrLayerUploads uploads = new EcrLayerUploads();
+        EcrLayerUploads uploads = new EcrLayerUploads(location -> { });
         EcrLayerUploads.Session session = uploads.require(SCOPE, uploads.open(SCOPE, "http://r/u"), "app");
         int tooBig = (int) (EcrLayerUploads.MAX_PART_SIZE + 1);
 
@@ -54,7 +56,7 @@ class EcrLayerUploadsTest {
 
     @Test
     void completionNeedsAPartAndEveryPartButTheLastAtLeast5MiB() {
-        EcrLayerUploads uploads = new EcrLayerUploads();
+        EcrLayerUploads uploads = new EcrLayerUploads(location -> { });
         EcrLayerUploads.Session empty = uploads.require(SCOPE, uploads.open(SCOPE, "http://r/a"), "app");
         assertEquals("EmptyUploadException",
                 assertThrows(AwsException.class, () -> EcrLayerUploads.checkComplete(empty)).getErrorCode());
@@ -77,7 +79,7 @@ class EcrLayerUploadsTest {
 
     @Test
     void anUploadBelongsToItsRepositoryAndEndsWhenClosed() {
-        EcrLayerUploads uploads = new EcrLayerUploads();
+        EcrLayerUploads uploads = new EcrLayerUploads(location -> { });
         String id = uploads.open(SCOPE, "http://r/u");
 
         assertEquals("UploadNotFoundException", assertThrows(AwsException.class,
@@ -94,7 +96,8 @@ class EcrLayerUploadsTest {
     @Test
     void anUploadIdleForADayIsDroppedWhenTheNextOneOpens() {
         MutableClock clock = new MutableClock(Instant.parse("2026-10-15T00:00:00Z"));
-        EcrLayerUploads uploads = new EcrLayerUploads(clock);
+        List<String> discarded = new ArrayList<>();
+        EcrLayerUploads uploads = new EcrLayerUploads(clock, discarded::add);
         String stale = uploads.open(SCOPE, "http://r/stale");
         String touched = uploads.open(SCOPE, "http://r/touched");
 
@@ -106,6 +109,21 @@ class EcrLayerUploadsTest {
         assertEquals("UploadNotFoundException",
                 assertThrows(AwsException.class, () -> uploads.require(SCOPE, stale, "app")).getErrorCode());
         assertEquals("http://r/touched2", uploads.require(SCOPE, touched, "app").location());
+        assertEquals(List.of("http://r/stale"), discarded);
+    }
+
+    @Test
+    void anUploadIdleForADayIsRefusedEvenWhenNoOtherOpens() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-10-15T00:00:00Z"));
+        List<String> discarded = new ArrayList<>();
+        EcrLayerUploads uploads = new EcrLayerUploads(clock, discarded::add);
+        String id = uploads.open(SCOPE, "http://r/idle");
+
+        clock.advance(Duration.ofHours(25));
+
+        assertEquals("UploadNotFoundException",
+                assertThrows(AwsException.class, () -> uploads.require(SCOPE, id, "app")).getErrorCode());
+        assertEquals(List.of("http://r/idle"), discarded);
     }
 
     private static void check(EcrLayerUploads.Session session, long first, long last, int length) {

@@ -10,11 +10,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 
 /**
  * The layer uploads opened by {@code InitiateLayerUpload}, each tied to the {@code registry:2}
  * upload session that holds its bytes. Sessions live in memory, as the registry's own do, and one
- * left idle for a day is dropped.
+ * left idle for a day is dropped, along with its registry upload session.
  */
 class EcrLayerUploads {
 
@@ -63,13 +64,16 @@ class EcrLayerUploads {
 
     private final Map<String, Session> sessions = new ConcurrentHashMap<>();
     private final Clock clock;
+    /** Cancels a dropped session's registry upload, given its location. */
+    private final Consumer<String> discard;
 
-    EcrLayerUploads() {
-        this(Clock.systemUTC());
+    EcrLayerUploads(Consumer<String> discard) {
+        this(Clock.systemUTC(), discard);
     }
 
-    EcrLayerUploads(Clock clock) {
+    EcrLayerUploads(Clock clock, Consumer<String> discard) {
         this.clock = clock;
+        this.discard = discard;
     }
 
     Instant now() {
@@ -79,15 +83,26 @@ class EcrLayerUploads {
     /** Opens an upload for the repository {@code scope} names, returning its upload ID. */
     String open(String scope, String location) {
         Instant now = clock.instant();
-        sessions.values().removeIf(s -> s.lastTouched.plus(IDLE_LIMIT).isBefore(now));
+        sessions.forEach((id, session) -> {
+            if (idle(session, now)) {
+                drop(id, session);
+            }
+        });
         String uploadId = UUID.randomUUID().toString();
         sessions.put(uploadId, new Session(scope, location, now));
         return uploadId;
     }
 
-    /** The open upload {@code uploadId} names in this repository, or {@code UploadNotFoundException}. */
+    /**
+     * The open upload {@code uploadId} names in this repository, or {@code UploadNotFoundException},
+     * which is also the answer for one idle for a day even if no other upload has opened since.
+     */
     Session require(String scope, String uploadId, String repositoryName) {
         Session session = uploadId == null ? null : sessions.get(uploadId);
+        if (session != null && idle(session, clock.instant())) {
+            drop(uploadId, session);
+            session = null;
+        }
         if (session == null || !session.scope.equals(scope)) {
             throw new AwsException("UploadNotFoundException",
                     "Upload with id '" + uploadId + "' is not found for repository '" + repositoryName + "'", 400);
@@ -97,6 +112,16 @@ class EcrLayerUploads {
 
     void close(String uploadId) {
         sessions.remove(uploadId);
+    }
+
+    private static boolean idle(Session session, Instant now) {
+        return session.lastTouched.plus(IDLE_LIMIT).isBefore(now);
+    }
+
+    private void drop(String uploadId, Session session) {
+        if (sessions.remove(uploadId, session)) {
+            discard.accept(session.location);
+        }
     }
 
     /**

@@ -79,7 +79,7 @@ public class EcrService implements ResourceProvider {
     private final EcrRegistryManager registryManager;
     private final EmulatorConfig config;
     private final RegionResolver regionResolver;
-    private final EcrLayerUploads layerUploads = new EcrLayerUploads();
+    private final EcrLayerUploads layerUploads = new EcrLayerUploads(this::discardUpload);
     private final Set<String> inFlightImmutableTags = ConcurrentHashMap.newKeySet();
 
     @Inject
@@ -684,8 +684,11 @@ public class EcrService implements ResourceProvider {
             }
             String stored = http.putManifest(storage, imageTag != null ? imageTag : digest, mediaType, imageManifest);
             String finalDigest = stored != null ? stored : digest;
-            imageMetaStore.put(imageMetaKey(region, repo.getRegistryId(), repositoryName, finalDigest),
-                    new ImageMetadata(finalDigest, Instant.now()));
+            // A retag keeps the image's first push time, as DescribeImages records it.
+            String metaKey = imageMetaKey(region, repo.getRegistryId(), repositoryName, finalDigest);
+            if (imageMetaStore.get(metaKey).isEmpty()) {
+                imageMetaStore.put(metaKey, new ImageMetadata(finalDigest, Instant.now()));
+            }
 
             Image image = new Image();
             image.setRegistryId(repo.getRegistryId());
@@ -751,6 +754,11 @@ public class EcrService implements ResourceProvider {
         return registryManager.blobUrl(repo.getRepositoryUri(), layerDigest);
     }
 
+    /** Cancels the registry upload session of a layer upload left idle for a day. */
+    private void discardUpload(String location) {
+        registryManager.httpClient().cancelUpload(location);
+    }
+
     /** Opens a registry upload session for one layer. */
     public LayerUpload initiateLayerUpload(String repositoryName, String registryId, String region) {
         Repository repo = requireRepo(repositoryName, registryId, region);
@@ -804,8 +812,15 @@ public class EcrService implements ResourceProvider {
         if (layerDigests == null || layerDigests.isEmpty() || layerDigests.size() > 100) {
             throw new AwsException("InvalidParameterException", "layerDigests must hold 1 to 100 digests", 400);
         }
+        // An upload holds one layer, so every digest given must name it.
         String digest = layerDigests.get(0);
-        requireLayerDigest(digest);
+        for (String d : layerDigests) {
+            requireLayerDigest(d);
+            if (!digest.equals(d)) {
+                throw new AwsException("InvalidParameterException",
+                        "layerDigests must all name the one layer the upload holds", 400);
+            }
+        }
         EcrLayerUploads.Session session = layerUploads.require(
                 key(region, repo.getRegistryId(), repositoryName), uploadId, repositoryName);
         synchronized (session) {

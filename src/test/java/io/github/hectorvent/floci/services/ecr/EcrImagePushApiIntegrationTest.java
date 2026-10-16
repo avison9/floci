@@ -89,6 +89,10 @@ class EcrImagePushApiIntegrationTest {
         call("CompleteLayerUpload", "{\"repositoryName\":\"" + REPO + "\",\"uploadId\":\"" + UPLOAD_ID
                 + "\",\"layerDigests\":[\"bad\"]}")
                 .statusCode(400).body("__type", equalTo("InvalidParameterException"));
+        // An upload holds one layer: a second, different digest is refused, not ignored.
+        call("CompleteLayerUpload", "{\"repositoryName\":\"" + REPO + "\",\"uploadId\":\"" + UPLOAD_ID
+                + "\",\"layerDigests\":[\"sha256:" + "a".repeat(64) + "\",\"sha256:" + "b".repeat(64) + "\"]}")
+                .statusCode(400).body("__type", equalTo("InvalidParameterException"));
     }
 
     @Test
