@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsRegions;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -20,11 +22,14 @@ import jakarta.inject.Inject;
 import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Function;
 
 /**
  * EMR management-plane business logic. Cluster and step lifecycles are simulated
@@ -403,11 +408,7 @@ public class EmrService {
 
     // ──────────────────────────── Release catalogue ────────────────────────────
 
-    /** One page of results and the token for the next page, or null at the end. */
-    public record Page<T>(List<T> items, String nextToken) {}
-
-    private static final int MIN_MAX_RESULTS = 1;
-    private static final int MAX_MAX_RESULTS = 100;
+    private static final int MAX_RESULTS = 100;
     private static final int INSTANCE_TYPE_PAGE = 50;
 
     /**
@@ -428,9 +429,15 @@ public class EmrService {
     /**
      * Release labels, newest first, narrowed by {@code prefix} (such as {@code emr-6}) and by
      * {@code application}, a name or {@code name@version} (such as {@code spark@3.5.2}) matched
-     * without regard to case.
+     * without regard to case. A token belongs to the filters it was issued for, so one replayed
+     * with other filters, or altered, is refused.
      */
-    public Page<String> listReleaseLabels(String prefix, String application, String nextToken, Integer maxResults) {
+    public PaginatedResult<String> listReleaseLabels(String prefix, String application, String nextToken,
+                                                     Integer maxResults) {
+        if (maxResults != null && (maxResults < 1 || maxResults > MAX_RESULTS)) {
+            throw new AwsException("InvalidRequestException",
+                    "MaxResults must be between 1 and " + MAX_RESULTS + ".", 400);
+        }
         String appName = null;
         String appVersion = null;
         if (application != null && !application.isBlank()) {
@@ -446,27 +453,24 @@ public class EmrService {
                         && (version == null || version.isEmpty() || a.version().equalsIgnoreCase(version))))
                 .map(EmrReleaseCatalog.Release::label)
                 .toList();
-        return page(labels, nextToken, maxResults, MAX_MAX_RESULTS);
+        String namespace = "ListReleaseLabels|" + Objects.toString(prefix, "") + "|" + Objects.toString(application, "");
+        return Pagination.paginate(labels, positionIn(labels), maxResults != null ? maxResults : MAX_RESULTS,
+                nextToken, namespace, EmrService::invalidToken);
     }
 
-    /** A release's applications, paged, with its OS releases; no label means the latest release. */
-    public record ReleaseDescription(String label, Page<EmrReleaseCatalog.Application> applications,
-                                     List<String> osReleases) {}
-
-    public ReleaseDescription describeReleaseLabel(String label, String nextToken, Integer maxResults) {
-        EmrReleaseCatalog.Release release = label == null || label.isBlank()
-                ? releases().get(0)
-                : requireRelease(label);
-        return new ReleaseDescription(release.label(),
-                page(release.applications(), nextToken, maxResults, MAX_MAX_RESULTS), release.osReleases());
+    /** A release's applications and OS releases; no label means the latest release. */
+    public EmrReleaseCatalog.Release describeReleaseLabel(String label) {
+        return label == null || label.isBlank() ? releases().get(0) : requireRelease(label);
     }
 
-    public Page<EmrReleaseCatalog.InstanceType> listSupportedInstanceTypes(String label, String marker) {
+    public PaginatedResult<EmrReleaseCatalog.InstanceType> listSupportedInstanceTypes(String label, String marker) {
         if (label == null || label.isBlank()) {
             throw new AwsException("InvalidRequestException", "ReleaseLabel is required.", 400);
         }
         requireRelease(label);
-        return page(EmrReleaseCatalog.INSTANCE_TYPES, marker, INSTANCE_TYPE_PAGE, INSTANCE_TYPE_PAGE);
+        List<EmrReleaseCatalog.InstanceType> types = EmrReleaseCatalog.INSTANCE_TYPES;
+        return Pagination.paginate(types, positionIn(types), INSTANCE_TYPE_PAGE, marker,
+                "ListSupportedInstanceTypes|" + label, EmrService::invalidToken);
     }
 
     private EmrReleaseCatalog.Release requireRelease(String label) {
@@ -477,26 +481,20 @@ public class EmrService {
                         "The specified release label " + label + " is not valid.", 400));
     }
 
-    /** Offset paging: the token is the index the next page starts at. */
-    private static <T> Page<T> page(List<T> items, String token, Integer maxResults, int defaultSize) {
-        if (maxResults != null && (maxResults < MIN_MAX_RESULTS || maxResults > MAX_MAX_RESULTS)) {
-            throw new AwsException("InvalidRequestException",
-                    "MaxResults must be between " + MIN_MAX_RESULTS + " and " + MAX_MAX_RESULTS + ".", 400);
+    /**
+     * A cursor that keeps the catalogue's own order: {@link Pagination} sorts by cursor, and the
+     * catalogue is newest first rather than alphabetical.
+     */
+    private static <T> Function<T, String> positionIn(List<T> items) {
+        Map<T, String> positions = new HashMap<>();
+        for (int i = 0; i < items.size(); i++) {
+            positions.put(items.get(i), String.format("%06d", i));
         }
-        int start = 0;
-        if (token != null && !token.isBlank()) {
-            try {
-                start = Integer.parseInt(token);
-            } catch (NumberFormatException e) {
-                start = -1;
-            }
-            if (start < 0 || start > items.size()) {
-                throw new AwsException("InvalidRequestException", "Invalid pagination token: " + token, 400);
-            }
-        }
-        int size = maxResults != null ? maxResults : defaultSize;
-        int end = Math.min(items.size(), start + size);
-        return new Page<>(items.subList(start, end), end < items.size() ? Integer.toString(end) : null);
+        return positions::get;
+    }
+
+    private static AwsException invalidToken(String token) {
+        return new AwsException("InvalidRequestException", "Invalid pagination token: " + token, 400);
     }
 
     public List<SecurityConfiguration> listSecurityConfigurations() {

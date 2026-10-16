@@ -64,7 +64,9 @@ catalogue is still listed, with no applications.
 
 `ListReleaseLabels` filters by `Prefix` (such as `emr-6`) and `Application` (`spark` or
 `spark@3.4.1`, matched without regard to case) and pages with `MaxResults` (1 to 100) /
-`NextToken`. `ListSupportedInstanceTypes` reports common families (c5, m5, m5d, m6g, r5, r6g) with
+`NextToken`; a token only works with the filters it was issued for. `DescribeReleaseLabel` answers
+every application at once, since AWS reserves its `MaxResults` and `NextToken` for future use.
+`ListSupportedInstanceTypes` reports common families (c5, m5, m5d, m6g, r5, r6g) with
 their EC2 sizes. An unknown release label, a bad token or an out-of-range `MaxResults` is
 `InvalidRequestException`. `RunJobFlow` does not check its release label or instance types against
 the catalogue.

@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsJson11Controller;
 import io.github.hectorvent.floci.core.common.AwsRegions;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.services.emr.model.EmrBlockPublicAccess;
 import io.github.hectorvent.floci.services.emr.model.EmrCluster;
 import io.github.hectorvent.floci.services.emr.model.EmrInstanceFleet;
@@ -336,9 +337,9 @@ public class EmrHandler {
 
     private Response handleListReleaseLabels(JsonNode request) {
         JsonNode filters = request.path("Filters");
-        EmrService.Page<String> page = service.listReleaseLabels(
-                textOrNull(filters.path("Prefix")), textOrNull(filters.path("Application")),
-                textOrNull(request.path("NextToken")), intOrNull(request.path("MaxResults")));
+        PaginatedResult<String> page = service.listReleaseLabels(
+                filters.path("Prefix").asText(null), filters.path("Application").asText(null),
+                request.path("NextToken").asText(null), intOrNull(request.path("MaxResults")));
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode labels = response.putArray("ReleaseLabels");
         page.items().forEach(labels::add);
@@ -349,17 +350,13 @@ public class EmrHandler {
     }
 
     private Response handleDescribeReleaseLabel(JsonNode request) {
-        EmrService.ReleaseDescription release = service.describeReleaseLabel(
-                textOrNull(request.path("ReleaseLabel")), textOrNull(request.path("NextToken")),
-                intOrNull(request.path("MaxResults")));
+        // MaxResults and NextToken are "reserved for future use" and AWS answers every application.
+        EmrReleaseCatalog.Release release = service.describeReleaseLabel(request.path("ReleaseLabel").asText(null));
         ObjectNode response = objectMapper.createObjectNode();
         response.put("ReleaseLabel", release.label());
         ArrayNode apps = response.putArray("Applications");
-        for (EmrReleaseCatalog.Application app : release.applications().items()) {
+        for (EmrReleaseCatalog.Application app : release.applications()) {
             apps.addObject().put("Name", app.name()).put("Version", app.version());
-        }
-        if (release.applications().nextToken() != null) {
-            response.put("NextToken", release.applications().nextToken());
         }
         ArrayNode os = response.putArray("AvailableOSReleases");
         release.osReleases().forEach(label -> os.addObject().put("Label", label));
@@ -367,8 +364,8 @@ public class EmrHandler {
     }
 
     private Response handleListSupportedInstanceTypes(JsonNode request) {
-        EmrService.Page<EmrReleaseCatalog.InstanceType> page = service.listSupportedInstanceTypes(
-                textOrNull(request.path("ReleaseLabel")), textOrNull(request.path("Marker")));
+        PaginatedResult<EmrReleaseCatalog.InstanceType> page = service.listSupportedInstanceTypes(
+                request.path("ReleaseLabel").asText(null), request.path("Marker").asText(null));
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode types = response.putArray("SupportedInstanceTypes");
         for (EmrReleaseCatalog.InstanceType t : page.items()) {
@@ -389,10 +386,6 @@ public class EmrHandler {
             response.put("Marker", page.nextToken());
         }
         return Response.ok(response).build();
-    }
-
-    private static String textOrNull(JsonNode node) {
-        return node == null || node.isMissingNode() || node.isNull() ? null : node.asText();
     }
 
     private static Integer intOrNull(JsonNode node) {
