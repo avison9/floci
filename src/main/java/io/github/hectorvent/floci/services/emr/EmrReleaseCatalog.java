@@ -155,18 +155,18 @@ final class EmrReleaseCatalog {
                     List.of("2.0.20260803.1", "2.0.20260727.0")));
 
     static final List<InstanceType> INSTANCE_TYPES = List.of(
-            new InstanceType("c5.xlarge", 4, 8f, 0, 0, true, "c5", "x86_64"),
-            new InstanceType("c5.2xlarge", 8, 16f, 0, 0, true, "c5", "x86_64"),
-            new InstanceType("m5.xlarge", 4, 16f, 0, 0, true, "m5", "x86_64"),
-            new InstanceType("m5.2xlarge", 8, 32f, 0, 0, true, "m5", "x86_64"),
-            new InstanceType("m5.4xlarge", 16, 64f, 0, 0, true, "m5", "x86_64"),
-            new InstanceType("m5d.xlarge", 4, 16f, 150, 1, false, "m5d", "x86_64"),
-            new InstanceType("m5d.2xlarge", 8, 32f, 300, 1, false, "m5d", "x86_64"),
-            new InstanceType("m6g.xlarge", 4, 16f, 0, 0, true, "m6g", "arm64"),
-            new InstanceType("m6g.2xlarge", 8, 32f, 0, 0, true, "m6g", "arm64"),
-            new InstanceType("r5.xlarge", 4, 32f, 0, 0, true, "r5", "x86_64"),
-            new InstanceType("r5.2xlarge", 8, 64f, 0, 0, true, "r5", "x86_64"),
-            new InstanceType("r6g.xlarge", 4, 32f, 0, 0, true, "r6g", "arm64"));
+            new InstanceType("c5.xlarge", 4, 8f, 0, 0, true, "c5", "X86_64"),
+            new InstanceType("c5.2xlarge", 8, 16f, 0, 0, true, "c5", "X86_64"),
+            new InstanceType("m5.xlarge", 4, 16f, 0, 0, true, "m5", "X86_64"),
+            new InstanceType("m5.2xlarge", 8, 32f, 0, 0, true, "m5", "X86_64"),
+            new InstanceType("m5.4xlarge", 16, 64f, 0, 0, true, "m5", "X86_64"),
+            new InstanceType("m5d.xlarge", 4, 16f, 150, 1, false, "m5d", "X86_64"),
+            new InstanceType("m5d.2xlarge", 8, 32f, 300, 1, false, "m5d", "X86_64"),
+            new InstanceType("m6g.xlarge", 4, 16f, 0, 0, true, "m6g", "AARCH64"),
+            new InstanceType("m6g.2xlarge", 8, 32f, 0, 0, true, "m6g", "AARCH64"),
+            new InstanceType("r5.xlarge", 4, 32f, 0, 0, true, "r5", "X86_64"),
+            new InstanceType("r5.2xlarge", 8, 64f, 0, 0, true, "r5", "X86_64"),
+            new InstanceType("r6g.xlarge", 4, 32f, 0, 0, true, "r6g", "AARCH64"));
 
     private EmrReleaseCatalog() {
     }

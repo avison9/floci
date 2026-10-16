@@ -49,6 +49,9 @@ class EmrReleaseCatalogIntegrationTest {
                 .body("ReleaseLabels", contains("emr-6.15.0", "emr-6.14.0"));
         call("ListReleaseLabels", "{\"Filters\":{\"Application\":\"Spark@3.4.1\"}}").then().statusCode(200)
                 .body("ReleaseLabels", contains("emr-6.15.0", "emr-6.14.0"));
+        // The version matches without regard to case too: the catalogue holds 4.14.3-HBase-1.4.
+        call("ListReleaseLabels", "{\"Filters\":{\"Application\":\"phoenix@4.14.3-hbase-1.4\"}}").then().statusCode(200)
+                .body("ReleaseLabels", contains("emr-5.36.2"));
         call("ListReleaseLabels", "{\"Filters\":{\"Application\":\"delta\"}}").then().statusCode(200)
                 .body("ReleaseLabels", everyItem(startsWith("emr-")))
                 .body("ReleaseLabels", hasSize(4));
@@ -80,7 +83,8 @@ class EmrReleaseCatalogIntegrationTest {
         call("ListSupportedInstanceTypes", "{\"ReleaseLabel\":\"emr-7.5.0\"}").then().statusCode(200)
                 .body("SupportedInstanceTypes.find { it.Type == 'm5.xlarge' }.VCPU", equalTo(4))
                 .body("SupportedInstanceTypes.find { it.Type == 'm5.xlarge' }.EbsStorageOnly", equalTo(true))
-                .body("SupportedInstanceTypes.find { it.Type == 'm6g.xlarge' }.Architecture", equalTo("arm64"))
+                .body("SupportedInstanceTypes.find { it.Type == 'm6g.xlarge' }.Architecture", equalTo("AARCH64"))
+                .body("SupportedInstanceTypes.find { it.Type == 'm5.xlarge' }.Architecture", equalTo("X86_64"))
                 .body("SupportedInstanceTypes.find { it.Type == 'm5d.xlarge' }.StorageGB", equalTo(150));
     }
 

@@ -443,7 +443,7 @@ public class EmrService {
         List<String> labels = releases().stream()
                 .filter(r -> prefix == null || prefix.isBlank() || r.label().startsWith(prefix))
                 .filter(r -> name == null || r.applications().stream().anyMatch(a -> a.name().equalsIgnoreCase(name)
-                        && (version == null || version.isEmpty() || a.version().equals(version))))
+                        && (version == null || version.isEmpty() || a.version().equalsIgnoreCase(version))))
                 .map(EmrReleaseCatalog.Release::label)
                 .toList();
         return page(labels, nextToken, maxResults, MAX_MAX_RESULTS);
