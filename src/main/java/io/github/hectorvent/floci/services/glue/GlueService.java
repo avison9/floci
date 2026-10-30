@@ -9,7 +9,6 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.core.common.RegionResolver;
-import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.glue.model.Classifier;
@@ -263,6 +262,7 @@ public class GlueService {
                 StorageBackend<String, GluePolicy> resourcePolicyStore,
                 StorageBackend<String, DataCatalogEncryptionSettings> encryptionSettingsStore,
                 StorageBackend<String, SecurityConfiguration> securityConfigurationStore,
+                StorageBackend<String, DataQualityRuleset> dataQualityRulesetStore,
                 StorageBackend<String, Trigger> triggerStore,
                 StorageBackend<String, Workflow> workflowStore,
                 GlueSchemaRegistryService schemaRegistryService,
@@ -284,7 +284,7 @@ public class GlueService {
         this.resourcePolicyStore = resourcePolicyStore;
         this.encryptionSettingsStore = encryptionSettingsStore;
         this.securityConfigurationStore = securityConfigurationStore;
-        this.dataQualityRulesetStore = new InMemoryStorage<>();
+        this.dataQualityRulesetStore = dataQualityRulesetStore;
         this.triggerStore = triggerStore;
         this.workflowStore = workflowStore;
         this.schemaRegistryService = schemaRegistryService;
@@ -3121,9 +3121,10 @@ public class GlueService {
                                                             Integer maxResults, String nextToken, String region) {
         return paginate(() -> {
             String prefix = region + ":";
+            String accountId = regionResolver.getAccountId();
             List<DataQualityRuleset> matching = new ArrayList<>();
             for (DataQualityRuleset candidate : dataQualityRulesetStore.scan(key -> key.startsWith(prefix))) {
-                if (matchesDataQualityFilter(candidate, filter) && carriesTags(candidate, tags, region)) {
+                if (matchesDataQualityFilter(candidate, filter, accountId) && carriesTags(candidate, tags, region)) {
                     matching.add(candidate);
                 }
             }
@@ -3177,7 +3178,9 @@ public class GlueService {
         return null;
     }
 
-    private static boolean matchesDataQualityFilter(DataQualityRuleset ruleset, DataQualityRulesetFilter filter) {
+    /** A target table without a CatalogId is in the caller's own catalog, the account. */
+    private static boolean matchesDataQualityFilter(DataQualityRuleset ruleset, DataQualityRulesetFilter filter,
+                                                    String accountId) {
         if (filter == null) {
             return true;
         }
@@ -3192,7 +3195,10 @@ public class GlueService {
                         || ruleset.getLastModifiedOn().isAfter(filter.lastModifiedAfter()))
                 && (filter.targetTable() == null || (table != null
                         && Objects.equals(filter.targetTable().tableName(), table.tableName())
-                        && Objects.equals(filter.targetTable().databaseName(), table.databaseName())));
+                        && Objects.equals(filter.targetTable().databaseName(), table.databaseName())
+                        && (filter.targetTable().catalogId() == null
+                                || filter.targetTable().catalogId().equals(
+                                        table.catalogId() != null ? table.catalogId() : accountId))));
     }
 
     private boolean carriesTags(DataQualityRuleset ruleset, Map<String, String> tags, String region) {

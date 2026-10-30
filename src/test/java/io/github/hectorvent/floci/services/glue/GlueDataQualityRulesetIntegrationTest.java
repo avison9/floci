@@ -160,6 +160,23 @@ class GlueDataQualityRulesetIntegrationTest {
     }
 
     @Test
+    void theTargetTableFilterMatchesTheCatalogWhenOneIsGiven() {
+        String account = "000000000077";
+        String own = "a-" + unique("own");
+        String shared = "b-" + unique("shared");
+        create(account, REGION, own, RULESET, "{\"TableName\":\"orders\",\"DatabaseName\":\"sales\"}", null);
+        create(account, REGION, shared, RULESET,
+                "{\"TableName\":\"orders\",\"DatabaseName\":\"sales\",\"CatalogId\":\"111111111111\"}", null);
+
+        assertEquals(List.of(own, shared), listNames(account,
+                "{\"Filter\":{\"TargetTable\":{\"TableName\":\"orders\",\"DatabaseName\":\"sales\"}}}"));
+        assertEquals(List.of(own), listNames(account, "{\"Filter\":{\"TargetTable\":"
+                + "{\"TableName\":\"orders\",\"DatabaseName\":\"sales\",\"CatalogId\":\"" + account + "\"}}}"));
+        assertEquals(List.of(shared), listNames(account, "{\"Filter\":{\"TargetTable\":"
+                + "{\"TableName\":\"orders\",\"DatabaseName\":\"sales\",\"CatalogId\":\"111111111111\"}}}"));
+    }
+
+    @Test
     void requestsTheModelRefusesUseItsErrors() {
         String account = "000000000074";
         String name = unique("errors");
