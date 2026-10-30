@@ -3124,7 +3124,8 @@ public class GlueService {
             String accountId = regionResolver.getAccountId();
             List<DataQualityRuleset> matching = new ArrayList<>();
             for (DataQualityRuleset candidate : dataQualityRulesetStore.scan(key -> key.startsWith(prefix))) {
-                if (matchesDataQualityFilter(candidate, filter, accountId) && carriesTags(candidate, tags, region)) {
+                if (matchesDataQualityFilter(candidate, filter, accountId) && (tags == null || tags.isEmpty()
+                        || hasTags(dataQualityRulesetArn(region, candidate.getName()), tags, region))) {
                     matching.add(candidate);
                 }
             }
@@ -3199,15 +3200,6 @@ public class GlueService {
                         && (filter.targetTable().catalogId() == null
                                 || filter.targetTable().catalogId().equals(
                                         table.catalogId() != null ? table.catalogId() : accountId))));
-    }
-
-    private boolean carriesTags(DataQualityRuleset ruleset, Map<String, String> tags, String region) {
-        if (tags == null || tags.isEmpty()) {
-            return true;
-        }
-        Map<String, String> held = resourceGroupsTaggingService.getTagsForResource(region,
-                dataQualityRulesetArn(region, ruleset.getName()));
-        return tags.entrySet().stream().allMatch(tag -> tag.getValue().equals(held.get(tag.getKey())));
     }
 
     private String dataQualityRulesetArn(String region, String name) {

@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.AwsJsonTimestamp;
 import io.github.hectorvent.floci.services.glue.model.*;
 import io.github.hectorvent.floci.services.glue.schemaregistry.GlueSchemaRegistryService;
 import io.github.hectorvent.floci.services.glue.schemaregistry.model.Registry;
@@ -1158,28 +1159,12 @@ public class GlueJsonHandler {
             return null;
         }
         return new GlueService.DataQualityRulesetFilter(node.path("Name").asText(null),
-                node.path("Description").asText(null), readTimestamp(node, "CreatedBefore"),
-                readTimestamp(node, "CreatedAfter"), readTimestamp(node, "LastModifiedBefore"),
-                readTimestamp(node, "LastModifiedAfter"), readTargetTable(node.get("TargetTable")));
-    }
-
-    /** A JSON 1.1 timestamp member: epoch seconds, possibly fractional. */
-    private static Instant readTimestamp(JsonNode parent, String field) {
-        JsonNode node = parent.get(field);
-        if (node == null || node.isNull()) {
-            return null;
-        }
-        double seconds;
-        if (node.isNumber()) {
-            seconds = node.asDouble();
-        } else {
-            try {
-                seconds = Double.parseDouble(node.asText());
-            } catch (NumberFormatException e) {
-                throw new AwsException("InvalidInputException", field + " must be a timestamp.", 400);
-            }
-        }
-        return Instant.ofEpochMilli(Math.round(seconds * 1000));
+                node.path("Description").asText(null),
+                AwsJsonTimestamp.epochSeconds(node, "CreatedBefore", "InvalidInputException"),
+                AwsJsonTimestamp.epochSeconds(node, "CreatedAfter", "InvalidInputException"),
+                AwsJsonTimestamp.epochSeconds(node, "LastModifiedBefore", "InvalidInputException"),
+                AwsJsonTimestamp.epochSeconds(node, "LastModifiedAfter", "InvalidInputException"),
+                readTargetTable(node.get("TargetTable")));
     }
 
     private static Map<String, Object> dataQualityListItem(DataQualityRuleset ruleset) {

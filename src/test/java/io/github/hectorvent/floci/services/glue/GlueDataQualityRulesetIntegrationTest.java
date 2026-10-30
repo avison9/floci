@@ -143,7 +143,11 @@ class GlueDataQualityRulesetIntegrationTest {
         assertEquals(List.of(), listNames(account, "{\"Filter\":{\"CreatedBefore\":" + (created - 1) + "}}"));
         assertEquals(List.of(), listNames(account, "{\"Filter\":{\"LastModifiedAfter\":" + (created + 3600) + "}}"));
         assertEquals(List.of(first, second), listNames(account,
-                "{\"Filter\":{\"LastModifiedBefore\":\"" + (created + 3600) + "\"}}"));
+                "{\"Filter\":{\"LastModifiedBefore\":" + (created + 3600) + "}}"));
+        call("ListDataQualityRulesets", account, REGION,
+                "{\"Filter\":{\"CreatedAfter\":\"" + created + "\"}}")
+                .statusCode(400)
+                .body("__type", equalTo("InvalidInputException"));
 
         String token = call("ListDataQualityRulesets", account, REGION, "{\"MaxResults\":1}")
                 .statusCode(200)
