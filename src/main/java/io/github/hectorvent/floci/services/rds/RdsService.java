@@ -1500,8 +1500,10 @@ public class RdsService implements Resettable, ResourceProvider {
         }
         return switch (backup.getStatus()) {
             case DbInstanceAutomatedBackup.ACTIVE -> livePointInTimeSource(backup.getInstance(), now);
-            case DbInstanceAutomatedBackup.REPLICATING -> livePointInTimeSource(
-                    getDbInstance(backup.getInstance().getDbInstanceIdentifier(), backup.getRegion()), now);
+            // The live source's data, checked against the replica's own window.
+            case DbInstanceAutomatedBackup.REPLICATING -> new PointInTimeSource(
+                    getDbInstance(backup.getInstance().getDbInstanceIdentifier(), backup.getRegion()), true,
+                    backup.getEarliestTime(), backup.getLatestTime(), null);
             default -> new PointInTimeSource(backup.getInstance(), false, backup.getEarliestTime(),
                     backup.getLatestTime(), backup.isDataSaved()
                             ? snapshotData.get(instanceBackupDataKey(region, backup.getInstance().getDbiResourceId()))
@@ -1638,9 +1640,11 @@ public class RdsService implements Resettable, ResourceProvider {
                     "BackupRetentionPeriod must be between 1 and 35.", 400);
         }
         String key = dbResourceKey(effectiveRegion, source.getDbiResourceId());
-        if (instanceAutomatedBackups.get(key).isPresent()) {
+        // A replica kept as retained after a stop is replaced, so replication can start again.
+        if (instanceAutomatedBackups.get(key)
+                .filter(b -> DbInstanceAutomatedBackup.REPLICATING.equals(b.getStatus())).isPresent()) {
             throw new AwsException("InvalidDBInstanceAutomatedBackupState",
-                    "DB instance " + sourceId + " already has automated backups in " + effectiveRegion + ".", 400);
+                    "DB instance " + sourceId + " is already replicating to " + effectiveRegion + ".", 400);
         }
         Instant now = Instant.now();
         DbInstanceAutomatedBackup replica = new DbInstanceAutomatedBackup();
@@ -1861,8 +1865,9 @@ public class RdsService implements Resettable, ResourceProvider {
         }
         String sourceId = arn.resource().substring("db:".length());
         DbInstance source = findInstanceForScope(currentAccountId(), arn.region(), sourceId);
-        if (source == null) {
-            throw new AwsException("DBInstanceNotFound", "DB instance " + sourceId + " not found.", 404);
+        // The whole ARN must name the instance, so another account's or partition's ARN finds nothing.
+        if (source == null || !sourceInstanceArn.equals(source.getDbInstanceArn())) {
+            throw new AwsException("DBInstanceNotFound", "DB instance " + sourceInstanceArn + " not found.", 404);
         }
         return source;
     }

@@ -208,6 +208,53 @@ class RdsAutomatedBackupsIntegrationTest {
                 .formParam("SourceDBInstanceArn", sourceArn)
         .when().post("/").then().statusCode(400)
                 .body(containsString("not replicating to the current region"));
+
+        // A stopped replica does not stand in the way of starting again.
+        query("StartDBInstanceAutomatedBackupsReplication", DESTINATION_REGION)
+                .formParam("SourceDBInstanceArn", sourceArn)
+        .when().post("/").then().statusCode(200)
+                .body(containsString("<Status>replicating</Status>"));
+        query("StopDBInstanceAutomatedBackupsReplication", DESTINATION_REGION)
+                .formParam("SourceDBInstanceArn", sourceArn)
+        .when().post("/").then().statusCode(200);
+        query("DeleteDBInstanceAutomatedBackup", DESTINATION_REGION).formParam("DBInstanceAutomatedBackupsArn", replicaArn)
+        .when().post("/").then().statusCode(200);
+    }
+
+    @Test
+    void aRestoreFromAReplicaIsCheckedAgainstTheReplicasWindow() {
+        createInstance("ab-src");
+        String dbi = dbiResourceId("ab-src");
+        Instant sourceEarliest = Instant.parse(backupsOf(dbi, SOURCE_REGION)
+                .getString("**.find { it.name() == 'EarliestTime' }"));
+        String replicaArn = query("StartDBInstanceAutomatedBackupsReplication", DESTINATION_REGION)
+                .formParam("SourceDBInstanceArn", "arn:aws:rds:" + SOURCE_REGION + ":000000000000:db:ab-src")
+                .when().post("/").then().statusCode(200)
+                .extract().xmlPath().getString("**.find { it.name() == 'DBInstanceAutomatedBackupsArn' }");
+        Instant replicaStart = Instant.parse(backupsOf(dbi, DESTINATION_REGION)
+                .getString("**.find { it.name() == 'EarliestTime' }"));
+        Instant beforeReplica = replicaStart.minusNanos(1);
+        assertTrue(beforeReplica.isAfter(sourceEarliest),
+                "the source must have been restorable before the replica started");
+
+        // Inside the source's window, but before the replica's.
+        query("RestoreDBInstanceToPointInTime", DESTINATION_REGION)
+                .formParam("SourceDBInstanceAutomatedBackupsArn", replicaArn)
+                .formParam("TargetDBInstanceIdentifier", "ab-restored")
+                .formParam("RestoreTime", beforeReplica.toString())
+        .when().post("/").then().statusCode(400)
+                .body(containsString("<Code>InvalidRestoreFault</Code>"));
+        query("RestoreDBInstanceToPointInTime", DESTINATION_REGION)
+                .formParam("SourceDBInstanceAutomatedBackupsArn", replicaArn)
+                .formParam("TargetDBInstanceIdentifier", "ab-restored")
+                .formParam("RestoreTime", replicaStart.toString())
+        .when().post("/").then().statusCode(200);
+
+        query("DeleteDBInstance", DESTINATION_REGION).formParam("DBInstanceIdentifier", "ab-restored")
+                .formParam("SkipFinalSnapshot", "true").when().post("/").then().statusCode(200);
+        query("StopDBInstanceAutomatedBackupsReplication", DESTINATION_REGION)
+                .formParam("SourceDBInstanceArn", "arn:aws:rds:" + SOURCE_REGION + ":000000000000:db:ab-src")
+        .when().post("/").then().statusCode(200);
         query("DeleteDBInstanceAutomatedBackup", DESTINATION_REGION).formParam("DBInstanceAutomatedBackupsArn", replicaArn)
         .when().post("/").then().statusCode(200);
     }
@@ -221,6 +268,15 @@ class RdsAutomatedBackupsIntegrationTest {
                 .body(containsString("<Code>InvalidParameterValue</Code>"));
         query("StartDBInstanceAutomatedBackupsReplication", DESTINATION_REGION)
                 .formParam("SourceDBInstanceArn", "arn:aws:rds:" + SOURCE_REGION + ":000000000000:db:ab-nosuch")
+        .when().post("/").then().statusCode(404)
+                .body(containsString("<Code>DBInstanceNotFound</Code>"));
+        // The same identifier in another account's ARN is not this account's instance.
+        query("StartDBInstanceAutomatedBackupsReplication", DESTINATION_REGION)
+                .formParam("SourceDBInstanceArn", "arn:aws:rds:" + SOURCE_REGION + ":111111111111:db:ab-src")
+        .when().post("/").then().statusCode(404)
+                .body(containsString("<Code>DBInstanceNotFound</Code>"));
+        query("StartDBInstanceAutomatedBackupsReplication", DESTINATION_REGION)
+                .formParam("SourceDBInstanceArn", "arn:aws:docdb:" + SOURCE_REGION + ":000000000000:db:ab-src")
         .when().post("/").then().statusCode(404)
                 .body(containsString("<Code>DBInstanceNotFound</Code>"));
         query("StopDBInstanceAutomatedBackupsReplication", DESTINATION_REGION)
