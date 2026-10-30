@@ -574,7 +574,7 @@ class RdsQueryHandlerTest {
         when(service.getDbInstance("mydb", null)).thenReturn(makeInstance("mydb"));
         doThrow(new AwsException("InvalidParameterCombination",
                 "Cannot delete protected DB Instance, please disable deletion protection and try again.", 400))
-                .when(service).deleteDbInstance("mydb", null);
+                .when(service).deleteDbInstance("mydb", null, true);
 
         MultivaluedMap<String, String> p = params();
         p.add("DBInstanceIdentifier", "mydb");
@@ -790,14 +790,14 @@ class RdsQueryHandlerTest {
 
         verify(service).listDbInstances(null, "us-west-2");
         verify(service).getDbInstance("mydb", "us-west-2");
-        verify(service).deleteDbInstance("mydb", "us-west-2");
+        verify(service).deleteDbInstance("mydb", "us-west-2", true);
         verify(service).modifyDbInstance(
                 eq("mydb"), isNull(), isNull(), isNull(), anyList(), isNull(), eq("us-west-2"), isNull(),
                 any(DbInstanceSettings.class), isNull(), any(DbInstanceScalingChanges.class), isNull(), isNull());
         verify(service).rebootDbInstance("mydb", "us-west-2");
         verify(service).listDbClusters(null, "us-west-2");
         verify(service).getDbCluster("mycluster", "us-west-2");
-        verify(service).deleteDbCluster("mycluster", "us-west-2");
+        verify(service).deleteDbCluster("mycluster", "us-west-2", true);
         verify(service).modifyDbCluster("mycluster", null, null,
                 null, null, null, null, null, null, "us-west-2");
     }
